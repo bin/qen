@@ -1,8 +1,8 @@
 use super::stats;
 use super::vm::{PlatformVmOps, VmError, VmOps};
-use std::ptr::NonNull;
 use crate::sync::atomic::Ordering;
 use crate::sync::{Arc, Mutex, OnceLock};
+use std::ptr::NonNull;
 
 /// A thread-safe pool of pages to reduce kernel overhead.
 pub struct SharedPagePoolState {
@@ -34,6 +34,9 @@ impl SharedPagePool {
 
     /// Allocate a page from the shared pool.
     ///
+    /// Pages are aligned to the OS page granularity (`mmap`/`VirtualAlloc`)
+    /// and no further — callers must NOT assume `size`-alignment.
+    ///
     /// # Panics
     ///
     /// Panics if the internal lock is poisoned.
@@ -53,7 +56,7 @@ impl SharedPagePool {
             if list.is_empty() {
                 state.pages.remove(&size);
             }
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "hardened"))]
             // Safety: ptr is valid and size is correct.
             unsafe {
                 std::ptr::write_bytes(ptr.as_ptr(), 0, size);
@@ -74,7 +77,7 @@ impl SharedPagePool {
             stats::TOTAL_COMMITTED.fetch_add(size, Ordering::Relaxed);
             stats::COMMAND_ARENA_COMMITTED.fetch_add(size, Ordering::Relaxed);
 
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "hardened"))]
             std::ptr::write_bytes(p.as_ptr(), 0, size);
 
             Ok(p)
@@ -108,9 +111,9 @@ impl SharedPagePool {
             // Safety: FFI call to release memory.
             unsafe {
                 drop(PlatformVmOps::release(ptr, size));
-                stats::sub_saturating(&stats::TOTAL_RESERVED, size);
-                stats::sub_saturating(&stats::TOTAL_COMMITTED, size);
-                stats::sub_saturating(&stats::COMMAND_ARENA_COMMITTED, size);
+                stats::TOTAL_RESERVED.sub(size);
+                stats::TOTAL_COMMITTED.sub(size);
+                stats::COMMAND_ARENA_COMMITTED.sub(size);
             }
         }
     }
@@ -127,9 +130,9 @@ impl SharedPagePool {
                 // Safety: FFI call to release memory.
                 unsafe {
                     drop(PlatformVmOps::release(*ptr, *size));
-                    stats::sub_saturating(&stats::TOTAL_RESERVED, *size);
-                    stats::sub_saturating(&stats::TOTAL_COMMITTED, *size);
-                    stats::sub_saturating(&stats::COMMAND_ARENA_COMMITTED, *size);
+                    stats::TOTAL_RESERVED.sub(*size);
+                    stats::TOTAL_COMMITTED.sub(*size);
+                    stats::COMMAND_ARENA_COMMITTED.sub(*size);
                 }
             }
         }
@@ -161,37 +164,20 @@ impl GlobalSharedPagePool {
 
 impl Drop for SharedPagePool {
     fn drop(&mut self) {
-        // We need to lock to access the map, but since we are in Drop,
-        // if we are the last owner (which we should be if we are dropped),
-        // we can just drain. But Mutex requires lock.
-        // Actually, if we are in Drop, we can get_mut on the mutex if we had ownership?
-        // But the field is `Mutex`. `Mutex` has `get_mut` which returns `LockResult<&mut T>`.
         // Since we have `&mut self`, we can bypass the lock.
-
         let state = match self.state.get_mut() {
             Ok(s) => s,
             Err(e) => e.into_inner(),
         };
-
-        // If get_mut fails (which shouldn't happen with &mut self unless something is very wrong,
-        // but the API returns Result), we might fall back to lock if we weren't mutable?
-        // Wait, get_mut requires &mut self. So we have exclusive access.
-        // The only error from get_mut is PoisonError. We just unwrapped it above.
-        
-        // Wait, if we use get_mut, we don't need lock at all.
-        // If we can't get_mut, maybe we should try lock? 
-        // But get_mut takes &mut self. If we have &mut self, no one else can have the lock.
-        // So get_mut is sufficient. The only case it returns Err is poison.
-        // And we handled poison.
 
         for (size, list) in &state.pages {
             for ptr in list {
                 // Safety: FFI call to release memory.
                 unsafe {
                     drop(PlatformVmOps::release(*ptr, *size));
-                    stats::sub_saturating(&stats::TOTAL_RESERVED, *size);
-                    stats::sub_saturating(&stats::TOTAL_COMMITTED, *size);
-                    stats::sub_saturating(&stats::COMMAND_ARENA_COMMITTED, *size);
+                    stats::TOTAL_RESERVED.sub(*size);
+                    stats::TOTAL_COMMITTED.sub(*size);
+                    stats::COMMAND_ARENA_COMMITTED.sub(*size);
                 }
             }
         }
@@ -216,6 +202,11 @@ pub struct CommandArena {
     current_page: usize,
     cursor: usize,
     page_size: usize,
+    /// Maximum alignment satisfiable on every page. Pool pages are only
+    /// guaranteed OS-page-aligned (see [`SharedPagePool::alloc`]), so an
+    /// alignment above `min(page_size, os_page_size)` could fail to fit
+    /// even in a fresh page; [`push`](Self::push) rejects it up front.
+    max_align: usize,
     pool: Arc<SharedPagePool>,
 }
 
@@ -223,12 +214,24 @@ pub struct CommandArena {
 unsafe impl Send for CommandArena {}
 
 impl CommandArena {
+    /// Create an arena that carves objects out of `page_size`-byte pages
+    /// from `pool`.
+    ///
+    /// `page_size` bounds the largest object (see [`push`](Self::push));
+    /// sizes below the OS page granularity still consume a full OS page of
+    /// physical memory per arena page.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `page_size` is zero.
     pub fn new(page_size: usize, pool: Arc<SharedPagePool>) -> Self {
+        assert!(page_size > 0, "CommandArena page_size must be non-zero");
         Self {
             original_pages: Vec::new(),
             current_page: 0,
             cursor: 0,
             page_size,
+            max_align: page_size.min(PlatformVmOps::page_size()),
             pool,
         }
     }
@@ -242,25 +245,6 @@ impl CommandArena {
             used: 0,
         });
         Ok(())
-    }
-
-    /// Helper to perform pointer arithmetic with debug-mode overflow checking.
-    #[inline]
-    unsafe fn offset_ptr(ptr: *mut u8, offset: usize) -> *mut u8 {
-        #[cfg(debug_assertions)]
-        {
-            let (v, of) = (ptr as usize).overflowing_add(offset);
-            debug_assert!(!of, "CommandArena pointer arithmetic overflow");
-            if of {
-                // Safety: Checked arithmetic overflow means we entered unreachable state in debug logic.
-                unsafe { std::hint::unreachable_unchecked() };
-            }
-            v as *mut u8
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            unsafe { ptr.add(offset) }
-        }
     }
 
     /// Push a command object into the arena.
@@ -277,9 +261,13 @@ impl CommandArena {
         let align = layout.align();
 
         // A single object MUST fit in one page; objects are not split.
-        // Also, alignment must not exceed page size, otherwise we cannot guarantee
-        // finding a page with sufficient alignment (pages are only aligned to page_size).
-        if size > self.page_size || align > self.page_size {
+        // Alignment is capped at min(page_size, OS page size): pool pages
+        // are only guaranteed OS-page-aligned, so a larger alignment could
+        // fail to fit even in a fresh page (the loop below would then
+        // reserve new pages forever). Under this cap, a fresh page (cursor
+        // 0, OS-page-aligned base ⇒ zero padding) always fits any accepted
+        // (size, align), so the loop terminates after at most one add_page.
+        if size > self.page_size || align > self.max_align {
             return Err(VmError::ObjectTooLarge {
                 size: std::cmp::max(size, align),
                 page_size: self.page_size,
@@ -301,41 +289,36 @@ impl CommandArena {
             let page_ptr = page_info.ptr;
             let page_cap = page_info.capacity;
 
-            // Note: We use `cursor` as the offset in the current page.
-            // If we switch pages, cursor resets to 0.
-
-            // Safety: cursor is tracked to be within page capacity.
-            let current_ptr = unsafe { Self::offset_ptr(page_ptr, self.cursor) };
-            let current_addr = current_ptr as usize;
+            // The fit check happens entirely in offsets; a pointer is only
+            // materialized (via `add`) once the range is proven in-bounds.
+            // Speculatively computing an out-of-bounds `end` pointer — as an
+            // earlier revision did — is undefined behaviour even if it is
+            // never dereferenced.
+            //
+            // `cursor` is the offset into the current page (resets to 0 on
+            // page switch); padding is computed from the real address so the
+            // returned pointer is aligned.
+            let current_addr = (page_ptr as usize) + self.cursor;
             let padding = (align - (current_addr % align)) % align;
-            
-            // Safety: padding ensures alignment, stays within page (checked later).
-            let start = unsafe { Self::offset_ptr(current_ptr, padding) };
-            // Safety: size calculation, checked against page_end below.
-            let end = unsafe { Self::offset_ptr(start, size) };
+            let start_offset = self.cursor + padding;
+            let end_offset = start_offset.saturating_add(size);
 
-            // Safety: page_cap is the valid capacity of the page.
-            let page_end = unsafe { Self::offset_ptr(page_ptr, page_cap) };
-
-            if end <= page_end {
+            if end_offset <= page_cap {
                 // Fits in current page
-                self.cursor = (end as usize) - (page_ptr as usize);
+                self.cursor = end_offset;
                 // Update used
                 if self.cursor > page_info.used {
                     page_info.used = self.cursor;
                 }
 
-                let ptr = start.cast::<T>();
-                // Safety: ptr is valid and aligned (checked padding) and fits in page (checked end <= page_end).
+                // Safety: start_offset + size <= page_cap, so the range is
+                // in-bounds of the page allocation; padding makes it aligned.
+                let ptr = unsafe { page_ptr.add(start_offset) }.cast::<T>();
+                // Safety: ptr is valid for writes of T (in-bounds, aligned).
                 unsafe { ptr.write(val) };
                 return Ok(ptr);
             }
 
-            // Move to next page
-            // Mark current page used size (if we are abandoning this page, `used` is currently set correctly from previous pushes)
-            // Actually, `used` tracks the high-water mark of successful pushes.
-            // If we fail here, we don't update `used`. Correct.
-            
             self.current_page += 1;
             self.cursor = 0;
         }
@@ -356,6 +339,16 @@ impl CommandArena {
     }
 
     /// Reset for reuse. Retains pages.
+    ///
+    /// # Invalidation contract
+    ///
+    /// Logically invalidates every pointer previously returned by
+    /// [`push`](Self::push)/[`push_or_panic`](Self::push_or_panic):
+    /// subsequent pushes hand out the same memory again. The returned raw
+    /// pointers are not lifetime-tracked, so the borrow checker cannot
+    /// enforce this — reading through a pre-reset pointer after new pushes
+    /// observes overwritten bytes (undefined behaviour once they no longer
+    /// form a valid `T`).
     pub fn reset(&mut self) {
         self.current_page = 0;
         self.cursor = 0;
@@ -441,9 +434,6 @@ mod tests {
     #[test]
     fn test_command_arena_push() {
         // Push enough to cross page boundary
-        // We use Copy type: [u8; N]
-        // But large arrays on stack might blow stack?
-        // We define a struct that implements Copy.
 
         #[derive(Clone, Copy)]
         struct LargeData {
@@ -490,7 +480,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "ObjectTooLarge")]
     fn test_command_arena_panic_on_too_large() {
@@ -544,11 +534,68 @@ mod tests {
         assert!(std::mem::align_of::<HugeAlign>() > page_size);
 
         match arena.push(HugeAlign(1)) {
-            Err(VmError::ObjectTooLarge { size, page_size: ps }) => {
+            Err(VmError::ObjectTooLarge {
+                size,
+                page_size: ps,
+            }) => {
                 assert_eq!(ps, page_size);
                 assert_eq!(size, std::cmp::max(1, std::mem::align_of::<HugeAlign>()));
             }
             other => panic!("expected ObjectTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_command_arena_rejects_alignment_beyond_os_page_granularity() {
+        use crate::sync::Arc;
+
+        // Pool pages are only OS-page-aligned, so an alignment above the OS
+        // page (even one below the arena's page_size) cannot be guaranteed.
+        // The old code accepted it and, when a page happened to be
+        // misaligned, looped forever reserving pages that could never fit.
+        #[derive(Clone, Copy)]
+        #[repr(align(131072))]
+        #[allow(dead_code)]
+        struct WideAlign(u8);
+
+        let _guard = crate::memory::TEST_MUTEX.read().unwrap();
+        let os_page = PlatformVmOps::page_size();
+        assert!(std::mem::align_of::<WideAlign>() > os_page);
+
+        // Arena pages big enough that the OLD `align > page_size` check
+        // would have accepted this alignment.
+        let arena_page = std::mem::align_of::<WideAlign>() * 2;
+        let pool = Arc::new(SharedPagePool::new(arena_page * 2));
+        let mut arena = CommandArena::new(arena_page, pool);
+
+        assert!(
+            matches!(
+                arena.push(WideAlign(1)),
+                Err(VmError::ObjectTooLarge { .. })
+            ),
+            "alignment above OS page granularity must be rejected, not looped on"
+        );
+    }
+
+    #[test]
+    fn test_command_arena_os_page_alignment_supported() {
+        use crate::sync::Arc;
+
+        // 4096 is <= the OS page size on every supported platform, so this
+        // alignment must be satisfiable on every page, including across
+        // page boundaries (loop termination).
+        #[derive(Clone, Copy)]
+        #[repr(C, align(4096))]
+        struct PageAligned([u8; 64]);
+
+        let _guard = crate::memory::TEST_MUTEX.read().unwrap();
+        let os_page = PlatformVmOps::page_size();
+        let pool = Arc::new(SharedPagePool::new(os_page * 8));
+        let mut arena = CommandArena::new(os_page * 2, pool);
+
+        for i in 0..8 {
+            let p = arena.push(PageAligned([i; 64])).unwrap();
+            assert_eq!(p as usize % 4096, 0, "push {i} misaligned");
         }
     }
 
@@ -611,13 +658,6 @@ mod tests {
             let mut arena = CommandArena::new(page_size, pool.clone());
             arena.push(1u8).unwrap(); // Alloc 1 page
         } // Drop arena
-
-        // Check pool state - hard to check private state.
-        // But we can check if we can alloc from pool without error.
-        // Or checking `stats::TOTAL_RESERVED`?
-        // Ideally we'd peer into `SharedPagePool`.
-        // But since we can't, we assume if `drop` runs without panic, logic is executed.
-        // The implementation explicitly calls `pool.free`.
     }
 
     #[test]
@@ -679,27 +719,35 @@ mod tests {
 
     #[test]
     fn test_command_arena_stats() {
-        let _guard = crate::memory::TEST_MUTEX.read().unwrap();
-        // D10: Check global stats increase
-        let initial = stats::TOTAL_COMMITTED.load(Ordering::Relaxed);
+        // D10: verify the command-arena gauge grows when a page is
+        // committed and returns exactly to baseline after trim.
+        //
+        // Only COMMAND_ARENA_COMMITTED is asserted: cross-subsystem gauges
+        // (TOTAL_COMMITTED) also move when other tests' thread-local caches
+        // are dropped at thread death, which happens AFTER those tests
+        // release TEST_MUTEX — even a write lock can't exclude that.
+        let _guard = crate::memory::TEST_MUTEX.write().unwrap();
+        let initial_arena = stats::COMMAND_ARENA_COMMITTED.load(Ordering::Relaxed);
 
         let page_size = 4096;
         let pool = Arc::new(SharedPagePool::new(page_size * 2));
-        let mut arena = CommandArena::new(page_size, pool);
+        {
+            let mut arena = CommandArena::new(page_size, pool.clone());
+            arena.push(1u8).unwrap();
 
-        arena.push(1u8).unwrap();
-
-        // This fails if SharedPagePool reuses a cached page from a previous test run (global state!).
-        // Ideally unit tests run in fresh process or we check delta if we can't isolate.
-        // But SharedPagePool::new creates a NEW pool.
-        // Allocating from it creates NEW pages (committing).
-        // So global stats SHOULD increase unless other threads free stuff.
-        // We'll rely on delta >= page_size.
-        let current = stats::TOTAL_COMMITTED.load(Ordering::Relaxed);
-        if current < initial + page_size {
-            // Flakiness risk if other tests run.
-            // Leaving this as a soft check or conditional.
+            assert!(
+                stats::COMMAND_ARENA_COMMITTED.load(Ordering::Relaxed) >= initial_arena + page_size,
+                "COMMAND_ARENA_COMMITTED did not grow by at least one page"
+            );
         }
+
+        // Dropping the arena returns the page to the pool (still committed);
+        // trimming the pool releases it and restores the gauge exactly.
+        pool.trim();
+        assert_eq!(
+            stats::COMMAND_ARENA_COMMITTED.load(Ordering::Relaxed),
+            initial_arena
+        );
     }
 
     #[test]
@@ -828,56 +876,80 @@ mod tests {
     #[test]
     fn test_shared_page_pool_capacity_exact_boundary() {
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
-        // I6: Free exactly capacity_bytes worth — next free of any size evicts to OS
-        // Capacity 8192 (2 pages)
+        // I6: cache capacity is exactly 2 pages; freeing a third page while
+        // the cache is full must release it to the OS, not grow the cache.
         let page_size = 4096;
         let pool = Arc::new(SharedPagePool::new(page_size * 2));
 
         let p1 = pool.alloc(page_size).unwrap();
         let p2 = pool.alloc(page_size).unwrap();
         let p3 = pool.alloc(page_size).unwrap();
+        let addr1 = p1.as_ptr() as usize;
+        let addr2 = p2.as_ptr() as usize;
+        let addr3 = p3.as_ptr() as usize;
 
-        // Return p1, p2 (fills cache)
-        // Safety: Test code.
+        // Return p1, p2: fills the cache to exactly capacity_bytes.
+        // Safety: pages were allocated from this pool with this size.
         unsafe {
             pool.free(p1, page_size);
             pool.free(p2, page_size);
         }
-
-        // Verify state? Hard without internal access.
-        // But we expect p3 to NOT fit in cache.
-        // We can check if it was released by checking if we get a DIFFERENT pointer when we alloc again?
-        // If it was cached, it might come back in LIFO order.
-        // Safety: Test code.
-        unsafe {
-            pool.free(p3, page_size);
+        {
+            let state = pool.state.lock().unwrap();
+            assert_eq!(
+                state.bytes,
+                page_size * 2,
+                "cache must hold exactly capacity"
+            );
+            assert_eq!(state.pages.get(&page_size).map(Vec::len), Some(2));
         }
 
-        // Now alloc 3 times.
+        // Cache is at capacity: freeing p3 must evict to the OS.
+        // Safety: p3 was allocated from this pool with this size.
+        unsafe { pool.free(p3, page_size) };
+        {
+            let state = pool.state.lock().unwrap();
+            assert_eq!(
+                state.bytes,
+                page_size * 2,
+                "over-capacity free must not grow the cache"
+            );
+            let cached: Vec<usize> = state.pages[&page_size]
+                .iter()
+                .map(|p| p.as_ptr() as usize)
+                .collect();
+            assert!(cached.contains(&addr1) && cached.contains(&addr2));
+            assert!(
+                !cached.contains(&addr3),
+                "the evicted page must not appear in the cache"
+            );
+        }
+
+        // Reallocation drains the cache LIFO, then maps a fresh page.
         let r1 = pool.alloc(page_size).unwrap();
         let r2 = pool.alloc(page_size).unwrap();
+        assert_eq!(
+            r1.as_ptr() as usize,
+            addr2,
+            "expected LIFO reuse of cached pages"
+        );
+        assert_eq!(
+            r2.as_ptr() as usize,
+            addr1,
+            "expected LIFO reuse of cached pages"
+        );
+        assert_eq!(pool.state.lock().unwrap().bytes, 0, "cache must be drained");
         let r3 = pool.alloc(page_size).unwrap();
 
-        // p3 should have been evicted.
-        // If the pool is LIFO, r1 gets p2, r2 gets p1. r3 gets new or p3-reallocated.
-        // This test is hard to observe cleanly without internal access or excessive mocking.
-        // But we can check that it doesn't crash or leak.
-
-        // Actually, we can check that we got valid memory.
-        // Safety: Test code.
+        // Return everything and trim so nothing outlives the test (miri
+        // runs with the leak checker enabled).
+        // Safety: pages were allocated from this pool with this size.
         unsafe {
-            *r1.as_ptr() = 1;
+            pool.free(r1, page_size);
+            pool.free(r2, page_size);
+            pool.free(r3, page_size);
         }
-        // Safety: Test code.
-        unsafe {
-            *r2.as_ptr() = 2;
-        }
-        // Safety: Test code.
-        unsafe {
-            *r3.as_ptr() = 3;
-        }
-
-        // Implicitly p3 was freed to OS.
+        pool.trim();
     }
 
     #[test]

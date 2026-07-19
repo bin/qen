@@ -54,13 +54,19 @@ impl Counter {
 
     #[inline]
     pub fn fetch_add(&self, val: usize, ordering: Ordering) -> usize {
-        self.0.fetch_add(Self::delta(val), ordering).max(0).cast_unsigned()
+        self.0
+            .fetch_add(Self::delta(val), ordering)
+            .max(0)
+            .cast_unsigned()
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn fetch_sub(&self, val: usize, ordering: Ordering) -> usize {
-        self.0.fetch_sub(Self::delta(val), ordering).max(0).cast_unsigned()
+        self.0
+            .fetch_sub(Self::delta(val), ordering)
+            .max(0)
+            .cast_unsigned()
     }
 }
 
@@ -91,15 +97,10 @@ crate::sync::static_atomic! {
 crate::sync::static_atomic! {
     pub static LARGE_ALLOC_CACHE_COMMITTED: Counter = Counter::new();
 }
+crate::sync::static_atomic! {
+    pub static LARGE_CACHE_NODE_POOL_EXHAUSTED: Counter = Counter::new();
+}
 
 crate::sync::static_atomic! {
     pub static COMMAND_ARENA_COMMITTED: Counter = Counter::new();
-}
-
-/// Best-effort subtract from a diagnostic atomic counter.
-///
-/// Uses a single atomic subtraction (no TOCTOU load-then-subtract race).
-/// Readers clamp negative transients via `Counter::load`.
-pub fn sub_saturating(counter: &Counter, val: usize) {
-    counter.sub(val);
 }

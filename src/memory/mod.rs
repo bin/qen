@@ -7,6 +7,7 @@ pub(crate) mod integration;
 pub(crate) mod large_cache;
 pub(crate) mod loom_tests;
 pub(crate) mod manager;
+pub(crate) mod remote_mask;
 pub(crate) mod stats;
 pub(crate) mod vm;
 

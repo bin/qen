@@ -1,0 +1,11 @@
+rpmalloc-benchmark/
+snmalloc/
+build/
+qen-adapter/target/
+qen-adapter/target-prof/
+qen-adapter/benchmark-*.txt
+benchmark-*.txt
+results/runfiles/
+google-tcmalloc/
+results-baseline-pre-items123/runfiles/
+results-adapterbug-items123/runfiles/

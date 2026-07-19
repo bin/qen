@@ -51,15 +51,19 @@ impl FrameArena {
         let size = layout.size();
         let align = layout.align();
 
-        let current_ptr = self.cursor as usize;
-        let padding = (align - (current_ptr % align)) % align;
-        let start = current_ptr.checked_add(padding).ok_or_else(|| {
+        // Arithmetic happens on offsets/addresses; the resulting pointers
+        // are derived from `self.base` (never from bare integers) so they
+        // keep their provenance.
+        let base_addr = self.base.as_ptr() as usize;
+        let current_addr = self.cursor as usize;
+        let padding = (align - (current_addr % align)) % align;
+        let start_addr = current_addr.checked_add(padding).ok_or_else(|| {
             VmError::CommitFailed(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 "FrameArena pointer arithmetic overflow (start)",
             ))
         })?;
-        let new_cursor = start.checked_add(size).ok_or_else(|| {
+        let end_addr = start_addr.checked_add(size).ok_or_else(|| {
             VmError::CommitFailed(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 "FrameArena pointer arithmetic overflow (end)",
@@ -67,9 +71,9 @@ impl FrameArena {
         })?;
 
         // Check if we need to commit more memory
-        if new_cursor > self.end as usize {
+        if end_addr > self.end as usize {
             // Safety: self.reserved matches reservation size.
-            if new_cursor > (unsafe { self.base.as_ptr().add(self.reserved) } as usize) {
+            if end_addr > (unsafe { self.base.as_ptr().add(self.reserved) } as usize) {
                 // Out of reserved space
                 return Err(VmError::CommitFailed(std::io::Error::new(
                     std::io::ErrorKind::OutOfMemory,
@@ -77,8 +81,8 @@ impl FrameArena {
                 )));
             }
 
-            // Commit up to new_cursor, rounded up to page size
-            let needed = new_cursor - (self.base.as_ptr() as usize);
+            // Commit up to end_addr, rounded up to page size
+            let needed = end_addr - base_addr;
             let target_commit = needed.next_multiple_of(PlatformVmOps::page_size());
 
             let commit_size = target_commit - self.committed;
@@ -99,17 +103,31 @@ impl FrameArena {
             self.end = unsafe { self.base.as_ptr().add(self.committed) };
         }
 
-        self.cursor = new_cursor as *mut u8;
-        #[cfg(debug_assertions)]
+        // Safety: start/end offsets were bounds-checked against the
+        // reservation above; deriving from base preserves provenance.
+        let start = unsafe { self.base.as_ptr().add(start_addr - base_addr) };
+        // Safety: same bounds check as above (end_addr <= base + reserved).
+        self.cursor = unsafe { self.base.as_ptr().add(end_addr - base_addr) };
+        #[cfg(any(debug_assertions, feature = "hardened"))]
         // Safety: start and size are within the newly committed/allocated region.
         unsafe {
-            std::ptr::write_bytes(start as *mut u8, 0, size);
+            std::ptr::write_bytes(start, 0, size);
         }
-        // Safety: start is non-null.
-        Ok(unsafe { NonNull::new_unchecked(start as *mut u8) })
+        // Safety: start is non-null (derived from non-null base).
+        Ok(unsafe { NonNull::new_unchecked(start) })
     }
 
     /// Reset the arena for reuse.
+    ///
+    /// # Invalidation contract
+    ///
+    /// Logically invalidates every allocation previously obtained from
+    /// [`alloc`](Self::alloc), [`alloc_val`](Self::alloc_val), or
+    /// [`alloc_slice`](Self::alloc_slice): subsequent allocations hand out
+    /// the same memory again. For safe callers this is enforced by the
+    /// borrow checker (allocations borrow `&mut self`, so no returned
+    /// reference can be held across `reset()`) — but code that keeps a raw
+    /// pointer into the arena must not dereference it afterwards.
     pub fn reset(&mut self) {
         self.cursor = self.base.as_ptr();
     }
@@ -131,7 +149,7 @@ impl FrameArena {
     ///
     /// # Panics
     ///
-    /// Panics if the decommit operation fails (debug builds only).
+    /// Panics if the decommit operation fails (debug and hardened builds only).
     pub fn trim(&mut self, high_water: usize) {
         let page_size = PlatformVmOps::page_size();
         let retain = high_water.next_multiple_of(page_size);
@@ -143,14 +161,14 @@ impl FrameArena {
 
             // Safety: FFI call to decommit memory.
             if unsafe { PlatformVmOps::decommit(decommit_start, decommit_size) }.is_ok() {
-                stats::sub_saturating(&stats::TOTAL_COMMITTED, decommit_size);
-                stats::sub_saturating(&stats::FRAME_ARENA_COMMITTED, decommit_size);
+                stats::TOTAL_COMMITTED.sub(decommit_size);
+                stats::FRAME_ARENA_COMMITTED.sub(decommit_size);
 
                 self.committed = retain;
                 // Safety: self.committed is within reserved range.
                 self.end = unsafe { self.base.as_ptr().add(self.committed) };
             } else {
-                #[cfg(debug_assertions)]
+                #[cfg(any(debug_assertions, feature = "hardened"))]
                 panic!(
                     "FrameArena::trim decommit failed at {decommit_start:p} (size={decommit_size})"
                 );
@@ -222,11 +240,11 @@ impl Drop for FrameArena {
         // Safety: FFI call to release memory.
         unsafe {
             drop(PlatformVmOps::release(self.base, self.reserved));
-            stats::sub_saturating(&stats::TOTAL_RESERVED, self.reserved);
+            stats::TOTAL_RESERVED.sub(self.reserved);
 
             if self.committed > 0 {
-                stats::sub_saturating(&stats::TOTAL_COMMITTED, self.committed);
-                stats::sub_saturating(&stats::FRAME_ARENA_COMMITTED, self.committed);
+                stats::TOTAL_COMMITTED.sub(self.committed);
+                stats::FRAME_ARENA_COMMITTED.sub(self.committed);
             }
         }
     }
@@ -285,35 +303,89 @@ thread_local! {
     static FRAME_ARENA: RefCell<ThreadFrameArena> = RefCell::new(ThreadFrameArena::new());
 }
 
-/// Helper to access the current thread's frame arena
+/// Helper to access the current thread's frame arena.
+///
+/// # Reentrancy
+///
+/// The closure receives `&mut FrameArena`, so a nested `with_frame_arena`
+/// call on the same thread would alias that exclusive borrow. Reentering
+/// from inside `f` therefore panics — deliberately, with a clear message
+/// (instead of the bare `BorrowMutError` it used to raise). Exclusivity is
+/// the correct contract here; the panic just makes violations diagnosable.
+///
+/// [`signal_trim_all`] IS safe to call from inside `f`: the current
+/// thread's trim is deferred to the next `with_frame_arena` entry.
+///
+/// # Panics
+///
+/// Panics on reentrant use (see above), and if the thread's arena cannot
+/// be created on first use (reservation failure).
 pub fn with_frame_arena<F, R>(f: F) -> R
 where
     F: FnOnce(&mut FrameArena) -> R,
 {
     FRAME_ARENA.with(|state| {
-        let mut state = state.borrow_mut();
+        let mut state = state.try_borrow_mut().expect(
+            "with_frame_arena is not reentrant: this thread's FrameArena \
+             is already mutably borrowed by an enclosing call",
+        );
         state.trim_if_signaled();
         f(state.ensure_arena())
     })
 }
 
 /// Signal every initialized thread-local frame arena to trim cooperatively.
-/// The current thread trims immediately if it has already created an arena.
+/// The current thread trims immediately when possible; other threads trim
+/// the next time they enter [`with_frame_arena`].
 pub(crate) fn signal_trim_all() {
     let new_epoch = FRAME_ARENA_TRIM_EPOCH
         .fetch_add(1, Ordering::AcqRel)
         .wrapping_add(1);
 
+    // If this thread is currently inside `with_frame_arena`, its arena is
+    // mutably borrowed and cannot be trimmed here. That is fine: the epoch
+    // bump above guarantees the trim happens on the next entry instead —
+    // so this function is safe to call from inside the closure.
     FRAME_ARENA.with(|state| {
-        let mut state = state.borrow_mut();
-        state.last_seen_trim_epoch = new_epoch;
-        state.trim_now();
+        if let Ok(mut state) = state.try_borrow_mut() {
+            state.last_seen_trim_epoch = new_epoch;
+            state.trim_now();
+        }
     });
 }
 
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_signal_trim_all_inside_with_frame_arena_is_deferred() {
+        let _guard = crate::memory::TEST_MUTEX.write().unwrap();
+        with_frame_arena(|arena| {
+            arena.reset();
+            let _ = arena.alloc_val(7u64).unwrap();
+            // Reentrant signal: must not panic (the arena is mutably
+            // borrowed by this closure); the local trim is deferred.
+            signal_trim_all();
+            assert!(arena.committed_bytes() > 0);
+        });
+        // The deferred cooperative trim runs on the next entry, before the
+        // closure observes the arena.
+        let committed = with_frame_arena(|arena| arena.committed_bytes());
+        assert_eq!(
+            committed, 0,
+            "deferred cooperative trim did not run on next entry"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not reentrant")]
+    fn test_with_frame_arena_reentrancy_panics_with_clear_message() {
+        let _guard = crate::memory::TEST_MUTEX.read().unwrap();
+        with_frame_arena(|_| {
+            with_frame_arena(|_| {});
+        });
+    }
 
     #[test]
     fn test_frame_arena() {
@@ -348,19 +420,34 @@ mod tests {
         let mut arena = FrameArena::new(page_size).unwrap();
 
         let p_u8 = arena.alloc_val(1u8).unwrap();
-        assert_eq!(std::ptr::from_mut(p_u8) as usize % std::mem::align_of::<u8>(), 0);
+        assert_eq!(
+            std::ptr::from_mut(p_u8) as usize % std::mem::align_of::<u8>(),
+            0
+        );
 
         let p_u16 = arena.alloc_val(1u16).unwrap();
-        assert_eq!(std::ptr::from_mut(p_u16) as usize % std::mem::align_of::<u16>(), 0);
+        assert_eq!(
+            std::ptr::from_mut(p_u16) as usize % std::mem::align_of::<u16>(),
+            0
+        );
 
         let p_u32 = arena.alloc_val(1u32).unwrap();
-        assert_eq!(std::ptr::from_mut(p_u32) as usize % std::mem::align_of::<u32>(), 0);
+        assert_eq!(
+            std::ptr::from_mut(p_u32) as usize % std::mem::align_of::<u32>(),
+            0
+        );
 
         let p_u64 = arena.alloc_val(1u64).unwrap();
-        assert_eq!(std::ptr::from_mut(p_u64) as usize % std::mem::align_of::<u64>(), 0);
+        assert_eq!(
+            std::ptr::from_mut(p_u64) as usize % std::mem::align_of::<u64>(),
+            0
+        );
 
         let p_u128 = arena.alloc_val(1u128).unwrap();
-        assert_eq!(std::ptr::from_mut(p_u128) as usize % std::mem::align_of::<u128>(), 0);
+        assert_eq!(
+            std::ptr::from_mut(p_u128) as usize % std::mem::align_of::<u128>(),
+            0
+        );
     }
 
     #[test]

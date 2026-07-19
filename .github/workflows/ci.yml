@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, features ${{ matrix.features }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        features: ["", "stats", "hardened", "stats,hardened"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain
+      - name: Check (all targets)
+        # The crate keeps `unused` at warn for local iteration; CI is strict
+        # about rustc warnings.
+        run: cargo check --all-targets --features "${{ matrix.features }}"
+        env:
+          RUSTFLAGS: -D warnings
+      - name: Clippy
+        # The tree is clippy-clean (pedantic included) across all feature
+        # combinations and targets; keep it that way.
+        run: cargo clippy --all-targets --features "${{ matrix.features }}" -- -D warnings
+      - name: Test
+        run: cargo test --features "${{ matrix.features }}"
+        env:
+          RUSTFLAGS: -D warnings
+
+  cross-check:
+    name: cross-compile check (windows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain + windows target
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Check windows
+        run: cargo check --target x86_64-pc-windows-msvc
+        env:
+          RUSTFLAGS: -D warnings
+      - name: Clippy windows
+        run: cargo clippy --target x86_64-pc-windows-msvc -- -D warnings
+
+  loom:
+    name: loom model checking (features ${{ matrix.features }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # `hardened` changes validation, not synchronization; its optimized
+        # behavior is covered by the hardened-release job below.
+        features: ["", "stats"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain
+      - name: Loom tests
+        # --release: loom explores thousands of interleavings per test.
+        run: cargo test --lib --release --features "${{ matrix.features }}"
+        env:
+          RUSTFLAGS: --cfg loom -D warnings
+
+  miri:
+    name: miri (UB + leak check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain
+      - name: Miri
+        # No MIRIFLAGS: the suite must pass with the leak checker enabled.
+        run: cargo miri test
+
+  hardened-release:
+    name: hardened release checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain
+      - name: Test optimized hardened mode
+        run: cargo test --release --all-features
+        env:
+          RUSTFLAGS: -D warnings

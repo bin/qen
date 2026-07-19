@@ -1,0 +1,22 @@
+[package]
+name = "qen-adapter"
+version = "0.1.0"
+description = "C-ABI adapter exposing qen through rpmalloc-benchmark's benchmark.h"
+publish = false
+edition = "2024"
+
+# Standalone crate (not a workspace member of qen).
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+qen = { path = "../.." }
+
+# No panic = "abort": the prebuilt std ships the unwind runtime, and
+# unwinding out of the extern "C" entry points aborts anyway.
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"

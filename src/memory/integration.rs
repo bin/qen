@@ -48,15 +48,23 @@ mod tests {
         // Clean up
         for c in chunks {
             // Safety: Test code.
-            unsafe { chunk_pool.free(c); }
+            unsafe {
+                chunk_pool.free(c);
+            }
         }
         for p in binned_ptrs {
             // Safety: Test code.
-            unsafe { GlobalBinnedAllocator::free_bytes(p, 32); }
+            unsafe {
+                GlobalBinnedAllocator::free_bytes(p, 32);
+            }
         }
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "native contention test; focused components run under Miri"
+    )]
     fn test_integration_thread_contention() {
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
         // X2: Multiple threads hitting GlobalBinnedAllocator and private allocators
@@ -108,7 +116,9 @@ mod tests {
                     // Clean up
                     for (ptr, size) in ptrs {
                         // Safety: Test code.
-                        unsafe { GlobalBinnedAllocator::free_bytes(ptr, size); }
+                        unsafe {
+                            GlobalBinnedAllocator::free_bytes(ptr, size);
+                        }
                     }
                 })
             })
@@ -134,12 +144,11 @@ mod tests {
     fn test_integration_leak_check() {
         use crate::memory::manager::MemoryManager;
         let _guard = crate::memory::TEST_MUTEX.write().unwrap();
-        let manager = MemoryManager::new();
 
         // 1. Initialize and established baseline
         drop(GlobalBinnedAllocator::init());
         MemoryManager::trim(); // Clear any noise from other tests
-        let baseline = manager.stats();
+        let baseline = MemoryManager::stats();
 
         // 2. Perform many allocations across all subsystems
         {
@@ -155,9 +164,13 @@ mod tests {
                 assert_eq!(*p_frame, i);
 
                 // Safety: Test code.
-                unsafe { GlobalBinnedAllocator::free_bytes(p_binned, size); }
+                unsafe {
+                    GlobalBinnedAllocator::free_bytes(p_binned, size);
+                }
                 // Safety: Test code.
-                unsafe { chunk_pool.free(p_chunk); }
+                unsafe {
+                    chunk_pool.free(p_chunk);
+                }
 
                 if i % 100 == 0 {
                     frame_arena.reset();
@@ -169,7 +182,7 @@ mod tests {
         MemoryManager::trim();
 
         // 4. Final check
-        let final_stats = manager.stats();
+        let final_stats = MemoryManager::stats();
 
         // Committed memory should return to baseline (or lower if other tests left garbage).
         // TOTAL_RESERVED might stay higher if GlobalBinnedAllocator grew its pools,
@@ -200,19 +213,28 @@ mod tests {
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
         // X5
         drop(GlobalBinnedAllocator::init());
-        let mut large = LargeAllocCache::new(1024 * 1024 * 10);
+        let large = LargeAllocCache::new(1024 * 1024 * 10);
         let layout = std::alloc::Layout::from_size_align(100 * 1024, 1).unwrap();
         let (ptr, size) = large.alloc(layout).unwrap();
         large.free(ptr, std::alloc::Layout::from_size_align(size, 1).unwrap());
     }
     #[test]
-    fn test_global_stats_no_negative() {
-        let _guard = crate::memory::TEST_MUTEX.read().unwrap();
-        // X6: Verify no negative stats after many operations
+    fn test_balanced_cycles_restore_subsystem_gauges() {
+        // X6: after balanced alloc/free cycles and drops, the subsystem
+        // gauges return to their starting values.
+        //
+        // Deliberately NOT asserted: point-in-time non-negativity of the
+        // raw global counters. Counter's documented contract tolerates
+        // transient sub-before-add dips below zero under concurrency, and
+        // other tests' thread-local caches drop at thread death outside
+        // TEST_MUTEX — so such a check fires spuriously in parallel runs.
+        // Counter's own invariants are model-checked by
+        // loom_counter_concurrent_add_sub instead.
+        let _guard = crate::memory::TEST_MUTEX.write().unwrap();
         drop(GlobalBinnedAllocator::init());
 
-        let _initial_res = stats::TOTAL_RESERVED.load(Ordering::Relaxed);
-        let _initial_com = stats::TOTAL_COMMITTED.load(Ordering::Relaxed);
+        let initial_chunk = stats::CHUNK_POOL_COMMITTED.load(Ordering::Relaxed);
+        let initial_frame = stats::FRAME_ARENA_COMMITTED.load(Ordering::Relaxed);
 
         {
             let mut chunk_pool = ChunkPool::new(128 * 1024 * 10).unwrap();
@@ -223,15 +245,32 @@ mod tests {
                 let c = chunk_pool.alloc().unwrap();
                 let _f = frame_arena.alloc_val(1u64).unwrap();
 
-                // Safety: Test code.
-            unsafe { chunk_pool.free(c); }
-                // Safety: Test code.
-            unsafe { GlobalBinnedAllocator::free_bytes(p, 32); }
+                // Safety: c was allocated from chunk_pool just above.
+                unsafe {
+                    chunk_pool.free(c);
+                }
+                // Safety: p was allocated with this size just above.
+                unsafe {
+                    GlobalBinnedAllocator::free_bytes(p, 32);
+                }
             }
         }
 
-        // Global stats can't be reliably checked in parallel tests.
-        // We just verify the operations themselves don't crash.
+        // The chunk-pool gauge returns exactly to baseline once the local
+        // pool drops (no TLS involvement, so exact equality is sound).
+        assert_eq!(
+            stats::CHUNK_POOL_COMMITTED.load(Ordering::Relaxed),
+            initial_chunk,
+            "ChunkPool commit gauge did not return to baseline"
+        );
+        // The frame-arena gauge is also touched by other tests' thread-local
+        // arenas being dropped at thread death (outside TEST_MUTEX), which
+        // can only subtract — so assert the local arena was fully returned
+        // without demanding exact equality.
+        assert!(
+            stats::FRAME_ARENA_COMMITTED.load(Ordering::Relaxed) <= initial_frame,
+            "FrameArena commit gauge did not return to baseline"
+        );
     }
 
     #[test]
@@ -294,12 +333,15 @@ mod tests {
         let page_size = 4096;
         let p1 = pool.alloc(page_size).unwrap();
 
-        // 3. Perform one allocation that we WILL NOT free (the leak)
-        let _leaked_ptr = pool.alloc(page_size).unwrap();
+        // 3. Perform one allocation that we deliberately hold across the
+        //    trim (simulating a leak from the trimmer's point of view)
+        let held_ptr = pool.alloc(page_size).unwrap();
 
         // 4. Free the first one
-        // Safety: Test code.
-        unsafe { pool.free(p1, page_size); }
+        // Safety: p1 was allocated from this pool with this size.
+        unsafe {
+            pool.free(p1, page_size);
+        }
 
         // 5. Trim everything to force cache releases
         MemoryManager::trim();
@@ -307,14 +349,23 @@ mod tests {
         // 6. Check deltas
         let final_command = stats::COMMAND_ARENA_COMMITTED.load(Ordering::Relaxed);
 
-        // Final stats should be >= initial + page_size (the leak)
+        // Final stats should be >= initial + page_size (the held page)
         assert!(
             final_command >= initial_command + page_size,
             "Leak not detected in COMMAND_ARENA_COMMITTED. Final: {final_command}, Initial: {initial_command}"
         );
+
+        // 7. Clean up: the "leak" was only leaked from the trimmer's view.
+        //    Return it so the test itself leaks nothing (miri leak check).
+        // Safety: held_ptr was allocated from this pool with this size.
+        unsafe {
+            pool.free(held_ptr, page_size);
+        }
+        MemoryManager::trim();
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "native high-pressure stress test")]
     fn test_integration_high_pressure_stress() {
         use crate::memory::chunk_pool::ChunkPool;
         use crate::memory::command_arena::{CommandArena, GlobalSharedPagePool};
@@ -360,7 +411,9 @@ mod tests {
                         let _ = frame.alloc_val(u64::from(i)).unwrap();
                         let _ = command_arena.push(i).unwrap();
 
-                        if i % 10 == 0 && let Ok(c) = chunk_pool.alloc() {
+                        if i % 10 == 0
+                            && let Ok(c) = chunk_pool.alloc()
+                        {
                             chunk_ptrs.push(c);
                         }
 
@@ -386,7 +439,9 @@ mod tests {
                     }
                     for (p, s) in binned_ptrs {
                         // Safety: Test code.
-                        unsafe { GlobalBinnedAllocator::free_bytes(p, s as usize); }
+                        unsafe {
+                            GlobalBinnedAllocator::free_bytes(p, s as usize);
+                        }
                     }
                     for (p, s) in large_ptrs {
                         lc.lock()
@@ -395,7 +450,9 @@ mod tests {
                     }
                     for p in chunk_ptrs {
                         // Safety: Test code.
-                        unsafe { chunk_pool.free(p); }
+                        unsafe {
+                            chunk_pool.free(p);
+                        }
                     }
                 })
             })

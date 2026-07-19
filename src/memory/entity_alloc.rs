@@ -1,9 +1,9 @@
 use super::stats;
 use super::vm::{PlatformVmOps, VmError, VmOps};
+use crate::sync::atomic::Ordering;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ptr::NonNull;
-use crate::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntityLocation {
@@ -57,11 +57,14 @@ impl Drop for EntityAllocator {
             let gen_reserved = self.reserved_capacity * std::mem::size_of::<u32>();
             let loc_reserved = self.reserved_capacity * std::mem::size_of::<EntityLocation>();
 
-            drop(PlatformVmOps::release(self.generations.cast(), gen_reserved));
+            drop(PlatformVmOps::release(
+                self.generations.cast(),
+                gen_reserved,
+            ));
             drop(PlatformVmOps::release(self.locations.cast(), loc_reserved));
 
-            stats::sub_saturating(&stats::TOTAL_RESERVED, gen_reserved + loc_reserved);
-            stats::sub_saturating(&stats::TOTAL_COMMITTED, self.committed_bytes());
+            stats::TOTAL_RESERVED.sub(gen_reserved + loc_reserved);
+            stats::TOTAL_COMMITTED.sub(self.committed_bytes());
         }
     }
 }
@@ -95,13 +98,14 @@ impl EntityAllocator {
         let cap = initial_capacity.max(1024);
         let max_cap = max_capacity.max(cap);
 
-        let gen_reserved_size = max_cap
-            .checked_mul(std::mem::size_of::<u32>())
-            .ok_or_else(|| {
-                VmError::InitializationFailed(
-                    "EntityAllocator generation reservation size overflow".to_string(),
-                )
-            })?;
+        let gen_reserved_size =
+            max_cap
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| {
+                    VmError::InitializationFailed(
+                        "EntityAllocator generation reservation size overflow".to_string(),
+                    )
+                })?;
         let loc_reserved_size = max_cap
             .checked_mul(std::mem::size_of::<EntityLocation>())
             .ok_or_else(|| {
@@ -189,14 +193,10 @@ impl EntityAllocator {
         // Safety: FFI calls to commit memory.
         unsafe {
             if let Err(e) = PlatformVmOps::commit(self.generations.cast(), new_gen_size) {
-                panic!(
-                    "EntityAllocator: failed to commit generations during grow: {e:?}",
-                );
+                panic!("EntityAllocator: failed to commit generations during grow: {e:?}",);
             }
             if let Err(e) = PlatformVmOps::commit(self.locations.cast(), new_loc_size) {
-                panic!(
-                    "EntityAllocator: failed to commit locations during grow: {e:?}",
-                );
+                panic!("EntityAllocator: failed to commit locations during grow: {e:?}",);
             }
         }
 
@@ -250,7 +250,7 @@ impl EntityAllocator {
     /// - `index` must not have been freed already.
     pub unsafe fn free(&mut self, index: u32) {
         if index >= self.high_water {
-            debug_assert!(false, "EntityAllocator::free: index out of bounds");
+            crate::qen_debug_assert!(false, "EntityAllocator::free: index out of bounds");
             // Safety: index < high_water check failed (debug_assert would have caught it).
             unsafe { std::hint::unreachable_unchecked() }
         }
@@ -262,7 +262,7 @@ impl EntityAllocator {
             // Safety: Alive entities always have even generations (0, 2, ...).
             // Freed entities have odd generations (1, 3, ...).
             if !current_gen.is_multiple_of(2) {
-                debug_assert!(
+                crate::qen_debug_assert!(
                     false,
                     "Double free detected in EntityAllocator for index {index}"
                 );
@@ -291,10 +291,11 @@ impl EntityAllocator {
     /// - Callers must ensure external synchronization if accessed concurrently.
     pub unsafe fn set_location(&mut self, index: u32, loc: EntityLocation) {
         if index >= self.high_water {
-            debug_assert!(
+            crate::qen_debug_assert!(
                 false,
                 "EntityAllocator::set_location: index {} out of bounds (high_water: {})",
-                index, self.high_water
+                index,
+                self.high_water
             );
             // Safety: index out of bounds.
             unsafe { std::hint::unreachable_unchecked() }
@@ -313,10 +314,11 @@ impl EntityAllocator {
     #[must_use]
     pub unsafe fn get_location(&self, index: u32) -> EntityLocation {
         if index >= self.high_water {
-            debug_assert!(
+            crate::qen_debug_assert!(
                 false,
                 "EntityAllocator::get_location: index {} out of bounds (high_water: {})",
-                index, self.high_water
+                index,
+                self.high_water
             );
             // Safety: index out of bounds.
             unsafe { std::hint::unreachable_unchecked() }
@@ -334,19 +336,20 @@ impl EntityAllocator {
     ///   (`index < high_water`) and is within the currently committed capacity.
     /// - `generation` must represent a live handle generation (even-valued).
     /// - Calling this on a freed/retired slot (odd current generation) is invalid.
-    ///   In debug builds this is asserted; in release builds it is undefined behavior.
+    ///   In debug or hardened builds this is asserted; in release builds it is undefined behavior.
     #[must_use]
     pub unsafe fn is_alive(&self, index: u32, generation: u32) -> bool {
         if index >= self.high_water {
-            debug_assert!(
+            crate::qen_debug_assert!(
                 false,
                 "EntityAllocator::is_alive: index {} out of bounds (high_water: {})",
-                index, self.high_water
+                index,
+                self.high_water
             );
             // Safety: index out of bounds.
             unsafe { std::hint::unreachable_unchecked() }
         }
-        debug_assert!(
+        crate::qen_debug_assert!(
             generation.is_multiple_of(2),
             "EntityAllocator::is_alive called with non-live generation {generation}",
         );
@@ -357,7 +360,7 @@ impl EntityAllocator {
 
         // Safety: index checked.
         let current = unsafe { *self.generations.as_ptr().add(index as usize) };
-        debug_assert!(
+        crate::qen_debug_assert!(
             current.is_multiple_of(2),
             "EntityAllocator::is_alive called on freed/retired slot {index} (generation {current})",
         );
@@ -451,7 +454,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "maximum capacity")]
     fn test_entity_alloc_max_capacity_exhaustion() {
@@ -610,7 +613,6 @@ mod tests {
         }
 
         // Safety: Test code.
-        // Safety: Test code.
         unsafe { alloc.free(id) }; // gen -> u32::MAX (odd = GENERATION_RETIRED)
 
         // The retired slot should NOT be returned by alloc.
@@ -661,7 +663,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "out of bounds")]
     fn test_entity_alloc_set_location_out_of_bounds() {
@@ -680,7 +682,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "out of bounds")]
     fn test_entity_alloc_get_location_out_of_bounds() {
@@ -690,7 +692,7 @@ mod tests {
         let _ = unsafe { alloc.get_location(0) };
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "index out of bounds")]
     fn test_free_out_of_bounds() {
@@ -701,7 +703,7 @@ mod tests {
         unsafe { alloc.free(0) };
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "Double free detected")]
     fn test_entity_alloc_double_free() {
@@ -711,24 +713,23 @@ mod tests {
         // Safety: Test code.
         unsafe { alloc.free(id) };
         // Safety: Test code.
-        // Safety: Test code.
         unsafe { alloc.free(id) }; // Should panic
     }
 
     // --- T1: free(index >= high_water) panics in all profiles ---
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "index out of bounds")]
     fn test_free_beyond_high_water_panics() {
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
-        // B1 fix verification: assert! (not debug_assert!) catches OOB index.
+        // B1 fix verification: the hardened assertion catches an OOB index.
         let mut alloc = EntityAllocator::new(1024).unwrap();
         let _ = alloc.alloc(); // high_water = 1
         // Safety: Test code.
         unsafe { alloc.free(1) }; // index 1 >= high_water(1) → always panics
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "index out of bounds")]
     fn test_free_large_index_panics() {

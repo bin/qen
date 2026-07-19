@@ -1,15 +1,25 @@
 It's an allocator.  A little messy; has a test suite and that's about all.
-Don't use it for anything that matters unless you want to run the risk of
-bugs.
+Don't use it.  It likely contains bugs.
 
-Intentionally disables just about every safety/bounds check/panic in
-release.  Better performance but no fun to debug.  Any misuse ever at all is UB.
-This is a base on which a less risky API is meant to go.
+Ordinary release builds intentionally disable most safety and bounds checks.
+The `hardened` feature retains allocator canaries, deterministic zeroing,
+bounds checks, and ownership assertions in optimized builds. Any misuse of the
+low-level unsafe API is still UB; this is a base on which a less risky API is
+meant to go.
+
+Qen is an explicit engine-memory allocator, not a Rust `#[global_allocator]`.
+Its metadata uses ordinary Rust collections, so self-hosting would recursively
+allocate while initializing or growing that metadata. Keep jemalloc, the system
+allocator, or another bootstrap-safe allocator as the process global allocator;
+initialize `GlobalBinnedAllocator` during startup and route controlled engine
+allocations through its explicit API.
 
 This uses a very large amount of unsafe rust.  Because it's an allocator.  It
 has a fine test suite, is model-checked via loom, and checks UB under miri.
+See Verification below for exactly what each of those does and does not cover.
 
-Supports only 64-bit targets and latest nightly.  Do not run it on 32-bit
+Supports only 64-bit targets and the nightly pinned in `rust-toolchain.toml`.
+Do not run it on 32-bit
 targets or those without an instruction for 128-bit atomic CAS.  It will be
 slow.
 
@@ -33,20 +43,102 @@ amortized O(1) for smaller.
 Global recycler is lock-free though technically not wait-free.  It's technically
 achievable (cf. Crystalline-W, Nikolaev '21) but often slower.  Use a lock-free
 Trieber stack with ABA guarded by 128-bit CAS (thanks modern architectures);
-ptr + gen count.  Seems the whole hyaline family and subsequent crystalline
+64-bit ptr + 32-bit generation + 32-bit bundle count packed in one word.  The
+count rides in the CAS deliberately: a separate counter races with detach
+(reset lands after the slot reopens to pushes) and quietly unbinds the
+occupancy cap.  Seems the whole hyaline family and subsequent crystalline
 do not outperform here.  Threads only touch global lock when recycler is full.
+Sharded 4 ways per size class (2 under loom, so the cross-shard paths still
+get model-checked).
 
-Thread-local caches batch work when interacting with global pool to amortize
-cost over more allocations.
+Thread-local caches are dense per-class pointer stacks in one lazily-paged
+slab per thread: push/pop are a single indexed store/load, and the
+allocator never reads or writes the object's own memory on the fast path —
+no intrusive links, no dependent-load pop chains, no cold-line touches
+(link words survive only on the recycler's overflow/orphan chains). The
+TLS handle is a raw `#[thread_local]` static (nightly), not `LocalKey` —
+measured at a third of the hot pair. Transfers between caches and the
+global tier move as dense batches through a per-class depot (one memcpy
+each way, `try_lock`-only: contention degrades to the lock-free recycler
+rather than ever parking). Pool refills write computed addresses straight
+into the cache's slots — a bump-path refill touches no bin memory at all.
+
+`free` works without a size: pools live in reserved-size-aligned spans, so
+the pointer's masked base resolves its size class from an L1-resident
+table (`try_free_ptr`). The sized API skips even that. Where tcmalloc
+answers the same question with a pagemap radix walk, here the address is
+the metadata.
 
 Cache flushing is co-operative; `trim` increments an atomic gen ctr and threads
 flush themselves.
 
-Generally, syscalls rarely happen while lock is held.  Possibly never; don't
-recall.
+Syscalls do not happen while a pool lock is held.  Commit uses a two-phase
+probe/integrate protocol (probe under the lock, mprotect outside it,
+reintegrate under the lock); trim/decommit mirrors it — begin_trim detaches
+fully-empty blocks under the lock (hidden from the bit tree, flagged
+`decommitting`), madvise runs unlocked, finish_trim reintegrates.  The one
+remaining exception is the cold huge-page/over-aligned path in the large
+cache, which syscalls under its own rarely-contended mutex.
+
+Fully-empty blocks survive `decommit_cooldown` trim passes (trailing blocks
+included) before their pages go back to the OS, so bursty workloads don't
+thrash madvise.
 
 Uses huge pages by default, falling back to smaller sizes if unavailable.
 1GB -> 2MB -> system default.
+
+# Verification
+
+- `cargo test` — full suite, all platforms the crate builds on.
+- `RUSTFLAGS="--cfg loom" cargo test --lib --release` — loom model checks of
+  the lock-free structures (recycler, node pool, bucket stacks) and the
+  trim/alloc protocols.  These run the exact shipping algorithms — no mutex
+  stand-ins.  CAS-loop tests use `preemption_bound(2)` (standard bounded
+  model checking).  The one thing loom cannot see is the global singleton's
+  one-shot init (its OnceLock shim wraps a std mutex; see `sync.rs`), so
+  loom tests exercise instance-based allocators.
+- `cargo miri test` — passes with no extra flags, leak check included.
+  Under miri (and loom) the VM layer is a heap-backed mock: it cannot make
+  access-after-decommit fault, but it panics on protocol violations
+  (commit/decommit outside a live reservation, decommit of uncommitted
+  ranges, mismatched release).  The 128-bit tagged stacks inherently round-
+  trip pointers through integers, so miri runs those with exposed
+  provenance rather than strict. Native high-thread-count stress cases are
+  ignored under the interpreter; their synchronization protocols are covered
+  by the loom models, while focused allocator paths still run under miri.
+- The real protection boundary is verified by subprocess fault tests on Linux
+  and Windows
+  (`test_decommitted_memory_faults_on_*`, `test_released_memory_faults_on_read`):
+  the test binary re-executes itself, the child touches decommitted or
+  released memory, and the parent asserts it died of an access violation
+  (SIGSEGV/SIGBUS, or STATUS_ACCESS_VIOLATION on Windows). Children have a
+  ten-second deadline. These tests are ignored on macOS because its crash
+  handling can leave intentional access-fault processes unkillable for minutes.
+- `--features stats` / `--features hardened` build and test in every ordinary
+  combination. Loom runs the default and `stats` configurations; `hardened`
+  changes validation rather than synchronization and has a separate optimized
+  release test. It keeps the debug-mode canaries, deterministic zeroing, bounds
+  checks, and ownership assertions active in release builds.
+- VM syscall failures (commit/decommit/release refusing) are covered by a
+  test-only fault-injection layer in `vm.rs`.
+
+# Benchmarks
+
+Measured against mimalloc, jemalloc, tcmalloc (gperftools), snmalloc,
+rpmalloc, and the system allocator with rpmalloc-benchmark — method,
+graphs, before/after data, and honest caveats in
+[bench/RESULTS.md](./bench/RESULTS.md), including the disclosure that all
+pre-2026-07-07 multi-thread numbers were capped by a bug in our own
+benchmark adapter (not qen).  Short version, clean data: lowest peak RSS
+of every allocator except gperftools tcmalloc, in every scenario at every
+thread count; single-threaded, second only to gperftools tcmalloc in four
+of five scenarios (ahead of mimalloc/snmalloc/rpmalloc once sizes pass
+~1KB); at 16 threads, second or third of the field past 1KB sizes —
+1.2–1.4× behind rpmalloc, ahead of tcmalloc everywhere its central
+free-list collapses — with the smallest-size scenario the one remaining
+scaling gap.  The road to internal (google/) tcmalloc — per-CPU rseq
+caches, transfer cache, hugepage-aware backend — is scoped in
+[bench/ROADMAP-sota.md](./bench/ROADMAP-sota.md).
 
 # Architecture
 
@@ -88,38 +180,56 @@ classDiagram
             <<Struct>>
             -block_size: usize
             -config: BinnedAllocatorConfig
-            -pools: Vec~Mutex~Option~Pool~~~  %% length = SIZE_CLASSES.len()
+            -pools: Vec~Mutex~PoolChain~~  %% length = SIZE_CLASSES.len()
+        }
+
+        class PoolChain {
+            <<Struct>>
+            Pools for one size class
+            -pools: Vec~Pool~
+            -pool_map: PoolFlatMap  %% growable base→index map
+            -active_index: usize  %% falls back to retired pools before reserving
         }
 
         class ThreadCache {
             <<Struct>>
-            -bins: Vec~LocalFreeList~
+            -bins: [LocalFreeList; NUM_SIZE_CLASSES]
+            -slab: *mut *mut u8  %% one lazily-paged allocation, all classes' slots
+            -slot_bases: [*mut *mut u8; N]  %% precomputed per-class slot pointers
+            -cached_bytes: usize  %% scavenged toward low-water past the byte budget
             -allocator: &BinnedAllocator
             +alloc()
             +free()
             +flush()
         }
 
-        class GlobalThreadCache {
-            <<TLS Handle>>
-            Provides per-thread ThreadCache via GLOBAL_THREAD_CACHE.with(...)
-            +with(f)
-            +signal_flush_all()
+        class RawThreadCache {
+            <<#[thread_local] static>>
+            Direct TLS-relative access; flush-at-exit via a registered guard
         }
 
         class LocalFreeList {
-            <<Struct>>
-            -head: Option~NonNull~
-            -count: u32
-            +push(ptr)
-            +pop() ptr
-            +take_bundle()
+            <<Dense stack bookkeeping>>
+            -top: u32
+            -max_length: u32  %% adaptive slow-start limit, grown per refill/overflow
+            -low_water: u32
+            +push(slots, ptr)
+            +pop(slots) ptr
+            +take_top(slots, n)  %% hot overflow, chain for the recycler
+            +take_bottom(slots, n)  %% cold scavenge
+        }
+
+        class Depot {
+            <<Per-class dense transfer, try_lock only>>
+            -slots: [[ptr; 32]; 16]  %% one memcpy in, one memcpy out
+            +push_batch()
+            +pop_batch()
         }
 
         class GlobalRecycler {
-            <<Lock-Free Stack (per size class)>>
-            -slots: [AtomicU128; SIZE_CLASSES.len()]
-            -counts: [AtomicU32; SIZE_CLASSES.len()]
+            <<Lock-Free Stack (sharded per size class)>>
+            -shards: [[RecyclerShard; SHARDS]; SIZE_CLASSES.len()]
+            %% each shard = one AtomicU128: ptr + 32-bit gen + 32-bit bundle count
             +push(bundle_head)
             +pop() bundle_head
             <<Uses word0 for intra-bundle next; word1 (offset 8) for recycler Treiber next>>
@@ -155,6 +265,7 @@ classDiagram
             <<Struct>>
             Packed u64 Metadata
             -canary: u8
+            -decommitting: u1  %% detached by an in-flight unlocked trim
             -committed: u1
             -bump_cursor: u16
             -free_head: u16
@@ -168,12 +279,17 @@ classDiagram
     namespace Large_Alloc {
         class LargeAllocCache {
             <<Struct>>
-            -cached: BTreeMap~size, Vec<ptr>~
-            -over_aligned: HashMap
-            -huge_allocs: HashMap
-            -cache_limit: usize
+            -bucket_cache: LargeBucketCache  %% lock-free tagged Treiber stacks
+            -special: Mutex  %% over_aligned + huge_allocs maps (cold path)
             +alloc(layout)
-            +free(ptr)
+            +free(ptr, layout)
+        }
+
+        class LargeBucketCache {
+            <<Lock-Free>>
+            -buckets: [AtomicU128; N]  %% ptr + generation tags
+            -node_pool: NodePool  %% tagged-index free list
+            -cache_limit: usize
         }
 
         class HugePageProbe {
@@ -260,7 +376,7 @@ classDiagram
     %% ========================================================================
     namespace Management {
         class MemoryManager {
-            <<Struct>>
+            <<Stateless Facade>>
             +trim()
             +stats() MemoryStats
         }
@@ -284,13 +400,15 @@ classDiagram
 
     %% Binned Allocator Internals
     GlobalBinnedAllocator --> BinnedAllocator : Wraps
-    BinnedAllocator *-- "SIZE_CLASSES.len()" Pool : Vec<Mutex<Option<Pool>>>
+    BinnedAllocator *-- "SIZE_CLASSES.len()" PoolChain : Vec<Mutex<PoolChain>>
+    PoolChain *-- "1..n" Pool : grows + reuses
     BinnedAllocator *-- "1" GlobalRecycler : Shared Lock-Free
-    BinnedAllocator *-- "1" LargeAllocCache : Overflow (>64KB)
+    BinnedAllocator *-- "1" LargeAllocCache : Overflow (>256KB)
     
     ThreadCache o-- BinnedAllocator : Binds to
-    GlobalThreadCache ..> ThreadCache : Owns per-thread instance
+    RawThreadCache ..> ThreadCache : Owns per-thread instance
     ThreadCache *-- LocalFreeList : One per size class
+    ThreadCache ..> Depot : Dense batch transfer (memcpy)
     ThreadCache ..> GlobalRecycler : Flushes bundles for remote reuse
     ThreadCache ..> Pool : Batched Refill (Underflow)
     
@@ -299,6 +417,7 @@ classDiagram
     Pool *-- BlockMeta : Tracks block state
 
     %% Large Alloc Internals
+    LargeAllocCache *-- LargeBucketCache : Fast path
     LargeAllocCache *-- HugePageProbe : Auto-detects support
 
     %% Arena Internals
@@ -323,9 +442,15 @@ classDiagram
 
 # TODO
 
-Consider stealing mimalloc's sharded metadata approach; might ding perf a bit
-but allow free() without size.  Probably introduces extra cacheline touches and
-definitely extra overhead.  Maybe not.
+Recycler holds up correctly under cross-thread frees but gives back scaling
+vs rpmalloc/snmalloc at 16 threads (~8-11 Mops/CPU-s vs 24-52).  Suspects:
+shard count (4), bundle cap, and the pool-mutex fallback once the recycler
+saturates.  Worth profiling before touching.
+
+The masked-base class table now supports size-free frees for pool allocations.
+Large and over-aligned allocations still require their layout; consider whether
+a sharded side-metadata design is worth its extra cache-line touches if a fully
+unsized public API becomes important.
 
 Pretty sure true wait-free guarantee on the recycler would cost more than it
 returns perf-wise vs. existing lock-free.

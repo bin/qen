@@ -1,8 +1,8 @@
 use super::stats;
 use super::vm::{PlatformVmOps, VmError, VmOps};
+use crate::sync::atomic::Ordering;
 use fixedbitset::FixedBitSet;
 use std::ptr::NonNull;
-use crate::sync::atomic::Ordering;
 
 use crate::sync::{Mutex, OnceLock};
 
@@ -87,7 +87,6 @@ impl GlobalChunkPool {
     pub unsafe fn free(ptr: NonNull<u8>) {
         if let Some(pool) = Self::get() {
             // Safety: We hold the lock.
-            // Safety: We hold the lock.
             unsafe {
                 pool.lock().unwrap().free(ptr);
             }
@@ -112,7 +111,6 @@ impl GlobalChunkPool {
 // Raw pointers are !Send, so we must implement it manually if safe.
 // Since it owns the memory, it is Send.
 // Safety: ChunkPool owns the memory and is Send.
-// Safety: ChunkPool owns the memory and is Send.
 unsafe impl Send for ChunkPool {}
 
 impl ChunkPool {
@@ -129,14 +127,15 @@ impl ChunkPool {
             VmError::InitializationFailed("ChunkPool reservation size overflow".to_string())
         })?;
         // Safety: FFI call to reserve memory.
-        // Safety: FFI call to reserve memory.
         let original_ptr = unsafe { PlatformVmOps::reserve(reserved_including_padding)? };
 
         let ptr_addr = original_ptr.as_ptr() as usize;
         let aligned_addr = (ptr_addr + CHUNK_ALIGN - 1) & !(CHUNK_ALIGN - 1);
-        // Safety: We just reserved this memory and aligned it, so it's non-null.
-        // Safety: We just reserved this memory and aligned it, so it's non-null.
-        let base = unsafe { NonNull::new_unchecked(aligned_addr as *mut u8) };
+        // Safety: the alignment offset stays within the padded reservation;
+        // deriving from original_ptr (not from the bare address) preserves
+        // provenance.
+        let base =
+            unsafe { NonNull::new_unchecked(original_ptr.as_ptr().add(aligned_addr - ptr_addr)) };
 
         // Track the full VM reservation, including alignment padding.
         stats::TOTAL_RESERVED.fetch_add(reserved_including_padding, Ordering::Relaxed);
@@ -167,7 +166,7 @@ impl ChunkPool {
             let ptr = unsafe { NonNull::new_unchecked(self.base.as_ptr().add(offset)) };
 
             if is_committed {
-                #[cfg(debug_assertions)]
+                #[cfg(any(debug_assertions, feature = "hardened"))]
                 // Safety: ptr is valid.
                 unsafe {
                     std::ptr::write_bytes(ptr.as_ptr(), 0, CHUNK_SIZE);
@@ -175,16 +174,14 @@ impl ChunkPool {
             } else {
                 // Try commit first
                 // Safety: FFI call to commit memory.
-                // Safety: FFI call to commit memory.
-                // Safety: FFI call to commit memory.
-        unsafe { PlatformVmOps::commit(ptr, CHUNK_SIZE)? };
-                
+                unsafe { PlatformVmOps::commit(ptr, CHUNK_SIZE)? };
+
                 // Commit succeeded, update state
                 self.actual_committed += CHUNK_SIZE;
                 stats::TOTAL_COMMITTED.fetch_add(CHUNK_SIZE, Ordering::Relaxed);
                 stats::CHUNK_POOL_COMMITTED.fetch_add(CHUNK_SIZE, Ordering::Relaxed);
-                
-                #[cfg(debug_assertions)]
+
+                #[cfg(any(debug_assertions, feature = "hardened"))]
                 // Safety: ptr is valid.
                 unsafe {
                     std::ptr::write_bytes(ptr.as_ptr(), 0, CHUNK_SIZE);
@@ -192,7 +189,7 @@ impl ChunkPool {
             }
 
             // Pop only after success
-            self.free_list.pop(); 
+            self.free_list.pop();
             self.live_count += 1;
             self.live_mask.insert(index);
             stats::CHUNK_POOL_LIVE.fetch_add(1, Ordering::Relaxed);
@@ -203,26 +200,19 @@ impl ChunkPool {
         // No free chunks, allocate new
         let next_offset = self.committed;
         let Some(next_end) = next_offset.checked_add(CHUNK_SIZE) else {
-            return Err(VmError::CommitFailed(std::io::Error::new(
-                std::io::ErrorKind::OutOfMemory,
-                "ChunkPool offset overflow",
-            )));
+            return Err(VmError::PoolExhausted);
         };
         if next_end > self.reserved {
             // Out of reserved space
-            return Err(VmError::CommitFailed(std::io::Error::new(
-                std::io::ErrorKind::OutOfMemory,
-                "ChunkPool exhausted reserved space",
-            )));
+            return Err(VmError::PoolExhausted);
         }
 
         let index = next_offset / CHUNK_SIZE;
         // Safety: next_offset is checked against reserved size.
-        // Safety: next_offset is checked against reserved size.
         let ptr = unsafe { NonNull::new_unchecked(self.base.as_ptr().add(next_offset)) };
         // Safety: FFI call to commit memory.
         unsafe { PlatformVmOps::commit(ptr, CHUNK_SIZE)? };
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "hardened"))]
         // Safety: ptr is valid.
         unsafe {
             std::ptr::write_bytes(ptr.as_ptr(), 0, CHUNK_SIZE);
@@ -252,7 +242,7 @@ impl ChunkPool {
 
         // Range check
         if ptr_addr < base_addr || ptr_addr >= base_addr + self.reserved {
-            debug_assert!(false, "Pointer {ptr:p} does not belong to this ChunkPool");
+            crate::qen_debug_assert!(false, "Pointer {ptr:p} does not belong to this ChunkPool");
             // Safety: Unreachable logic.
             unsafe {
                 std::hint::unreachable_unchecked();
@@ -263,7 +253,7 @@ impl ChunkPool {
 
         // Alignment check
         if !offset.is_multiple_of(CHUNK_SIZE) {
-            debug_assert!(false, "Pointer {ptr:p} is not aligned to CHUNK_SIZE");
+            crate::qen_debug_assert!(false, "Pointer {ptr:p} is not aligned to CHUNK_SIZE");
             // Safety: Unreachable logic.
             unsafe {
                 std::hint::unreachable_unchecked();
@@ -274,7 +264,7 @@ impl ChunkPool {
 
         // Commitment check - ensure we aren't freeing something we never even high-water allocated
         if offset >= self.committed {
-            debug_assert!(
+            crate::qen_debug_assert!(
                 false,
                 "Pointer {ptr:p} belongs to an unallocated region of this ChunkPool",
             );
@@ -286,7 +276,7 @@ impl ChunkPool {
 
         // Double free check
         if !self.live_mask.contains(index) {
-            debug_assert!(
+            crate::qen_debug_assert!(
                 false,
                 "Double free detected in ChunkPool for pointer {ptr:p}",
             );
@@ -301,7 +291,7 @@ impl ChunkPool {
         self.free_list.push((index, true));
         self.live_count -= 1;
 
-        stats::sub_saturating(&stats::CHUNK_POOL_LIVE, 1);
+        stats::CHUNK_POOL_LIVE.sub(1);
     }
 
     #[must_use]
@@ -319,7 +309,7 @@ impl ChunkPool {
     ///
     /// # Panics
     ///
-    /// Panics if the decommit operation fails (debug builds only).
+    /// Panics if the decommit operation fails (debug and hardened builds only).
     pub fn trim(&mut self) {
         // Decommit all committed chunks in the free list
         let mut decommitted_count = 0;
@@ -329,13 +319,13 @@ impl ChunkPool {
                 let offset = *index * CHUNK_SIZE;
                 // Safety: index is valid.
                 // Safety: offset is within bounds (checked by logic).
-            let ptr = unsafe { NonNull::new_unchecked(self.base.as_ptr().add(offset)) };
+                let ptr = unsafe { NonNull::new_unchecked(self.base.as_ptr().add(offset)) };
                 // Safety: FFI call to decommit memory.
                 if unsafe { PlatformVmOps::decommit(ptr, CHUNK_SIZE) }.is_ok() {
                     *is_committed = false;
                     decommitted_count += 1;
                 } else {
-                    #[cfg(debug_assertions)]
+                    #[cfg(any(debug_assertions, feature = "hardened"))]
                     panic!("ChunkPool::trim decommit failed for chunk index {}", *index);
                 }
             }
@@ -344,8 +334,8 @@ impl ChunkPool {
         if decommitted_count > 0 {
             let bytes = decommitted_count * CHUNK_SIZE;
             self.actual_committed -= bytes;
-            stats::sub_saturating(&stats::TOTAL_COMMITTED, bytes);
-            stats::sub_saturating(&stats::CHUNK_POOL_COMMITTED, bytes);
+            stats::TOTAL_COMMITTED.sub(bytes);
+            stats::CHUNK_POOL_COMMITTED.sub(bytes);
         }
 
         // Note: we leave them in the free_list. alloc() needs to re-commit.
@@ -357,16 +347,19 @@ impl Drop for ChunkPool {
     fn drop(&mut self) {
         // Safety: We are dropping the pool, so we can release the memory.
         unsafe {
-            drop(PlatformVmOps::release(self.original_ptr, self.reserved_including_padding));
-            stats::sub_saturating(&stats::TOTAL_RESERVED, self.reserved_including_padding);
+            drop(PlatformVmOps::release(
+                self.original_ptr,
+                self.reserved_including_padding,
+            ));
+            stats::TOTAL_RESERVED.sub(self.reserved_including_padding);
 
             if self.actual_committed > 0 {
-                stats::sub_saturating(&stats::TOTAL_COMMITTED, self.actual_committed);
-                stats::sub_saturating(&stats::CHUNK_POOL_COMMITTED, self.actual_committed);
+                stats::TOTAL_COMMITTED.sub(self.actual_committed);
+                stats::CHUNK_POOL_COMMITTED.sub(self.actual_committed);
             }
 
             if self.live_count > 0 {
-                stats::sub_saturating(&stats::CHUNK_POOL_LIVE, self.live_count);
+                stats::CHUNK_POOL_LIVE.sub(self.live_count);
             }
         }
     }
@@ -614,7 +607,7 @@ mod tests {
         assert_eq!(pool.committed_bytes(), CHUNK_SIZE);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "does not belong to this ChunkPool")]
     fn test_chunk_pool_free_out_of_range() {
@@ -626,7 +619,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "is not aligned to CHUNK_SIZE")]
     fn test_chunk_pool_free_misaligned() {
@@ -639,7 +632,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "belongs to an unallocated region")]
     fn test_chunk_pool_free_unallocated() {
@@ -654,7 +647,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "hardened"))]
     #[test]
     #[should_panic(expected = "Double free detected")]
     fn test_chunk_pool_double_free() {

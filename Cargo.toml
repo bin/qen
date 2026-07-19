@@ -4,13 +4,19 @@ version = "0.1.0"
 description = "allocator/memory subsystem for simulation/ECS"
 repository = "https://github.com/bin/qen"
 readme = "README.md"
-license = "NONE"
-keywords = ["no"]
-categories = ["no"]
+# Unlicensed, experimental, and not meant for crates.io.
+publish = false
 edition = "2024"
 
 [lib]
 crate-type = ["rlib", "dylib", "staticlib"]
+
+[features]
+default = []
+stats = []
+# Retain allocator canaries, deterministic zeroing, bounds checks, and
+# ownership assertions in optimized builds.
+hardened = []
 
 [dependencies]
 fixedbitset = "0.5.7"
@@ -18,10 +24,13 @@ libc = "0.2.180"
 portable-atomic = "1.13.1"
 
 [lints.rust]
-future_incompatible = "deny"
-deprecated_safe = "deny"
-let_underscore = "deny"
-#unused = "deny"
+# Groups get priority -1 so individual lints below can override them
+# (cargo warns about ambiguous same-priority group/lint mixes otherwise).
+future_incompatible = { level = "deny", priority = -1 }
+deprecated_safe = { level = "deny", priority = -1 }
+let_underscore = { level = "deny", priority = -1 }
+# `unused` stays at its default (warn): CI enforces `-D warnings` on the
+# check/test steps instead, so local builds don't hard-fail while iterating.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)'] }
 
 unsafe_op_in_unsafe_fn = "deny"

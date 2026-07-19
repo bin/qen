@@ -7,6 +7,9 @@
 // **Every** file in the crate must import sync primitives through this module.
 // A single direct `use std::sync::atomic::*` would bypass loom's scheduler and
 // silently break exhaustive testing.
+//
+// Known, deliberate exception: the loom `OnceLock` shim below wraps a real
+// `std::sync::Mutex` — see its comment for the rationale and consequences.
 #![allow(unused_imports, unused_macros)]
 
 // ---------------------------------------------------------------------------
@@ -15,41 +18,41 @@
 pub(crate) mod atomic {
     #[cfg(loom)]
     pub(crate) use loom::sync::atomic::{
-        AtomicU32, AtomicU64, AtomicUsize, AtomicIsize, Ordering, fence,
-        AtomicU128, AtomicI128,
+        AtomicI128, AtomicIsize, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicU128,
+        AtomicUsize, Ordering, fence,
     };
 
     #[cfg(not(loom))]
     pub(crate) use std::sync::atomic::{
-        AtomicU32, AtomicU64, AtomicUsize, AtomicIsize, Ordering, fence,
+        AtomicIsize, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
     };
 
     #[cfg(not(loom))]
-    pub(crate) use portable_atomic::{AtomicU128, AtomicI128};
+    pub(crate) use portable_atomic::{AtomicI128, AtomicU128};
 }
 
 // ---------------------------------------------------------------------------
 // sync (Mutex, Arc, RwLock)
 // ---------------------------------------------------------------------------
 #[cfg(loom)]
-pub(crate) use loom::sync::{Mutex, Arc, RwLock};
+pub(crate) use loom::sync::{Arc, Mutex, RwLock};
 
 #[cfg(not(loom))]
-pub(crate) use std::sync::{Mutex, Arc, RwLock};
+pub(crate) use std::sync::{Arc, Mutex, RwLock};
 
 // ---------------------------------------------------------------------------
 // cell (UnsafeCell, Cell)
 //
 // loom's UnsafeCell differs from std: `.get()` returns a `ConstPtr<T>` wrapper
 // instead of `*mut T`.  To write code that compiles under both, use the
-// `unsafe_cell_get!` and `unsafe_cell_get_mut!` helper macros.
+// `unsafe_cell_get_mut!` helper macro.
 // ---------------------------------------------------------------------------
 pub(crate) mod cell {
     #[cfg(loom)]
-    pub(crate) use loom::cell::{UnsafeCell, Cell};
+    pub(crate) use loom::cell::{Cell, UnsafeCell};
 
     #[cfg(not(loom))]
-    pub(crate) use std::cell::{UnsafeCell, Cell};
+    pub(crate) use std::cell::{Cell, UnsafeCell};
 }
 
 /// Access the contents of an `UnsafeCell` as `&mut T`.
@@ -91,10 +94,10 @@ pub(crate) mod hint {
 // ---------------------------------------------------------------------------
 pub(crate) mod thread {
     #[cfg(loom)]
-    pub(crate) use loom::thread::{spawn, yield_now, current, JoinHandle};
+    pub(crate) use loom::thread::{JoinHandle, current, spawn, yield_now};
 
     #[cfg(not(loom))]
-    pub(crate) use std::thread::{spawn, yield_now, current, JoinHandle};
+    pub(crate) use std::thread::{JoinHandle, current, spawn, yield_now};
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +148,14 @@ pub(crate) mod barrier {
 // Mutex::new() is not const.  Since OnceLock is init-once, the inner Mutex is
 // not a synchronization point that loom needs to explore — it only serialises
 // the one-shot initialisation.
+//
+// CONSEQUENCE (deliberate exception to this module's "everything through the
+// shim" rule): any state behind an `OnceLock` — notably the
+// `GlobalBinnedAllocator` singleton — has its *initialisation race* outside
+// loom's exploration, and the value persists across loom iterations instead
+// of resetting. This is why loom tests exercise instance-based allocators
+// only (see the design notes in `loom_tests.rs`); everything the global
+// wrapper does beyond one-shot init is covered through those instances.
 // ---------------------------------------------------------------------------
 #[cfg(not(loom))]
 pub(crate) use std::sync::OnceLock;
@@ -255,4 +266,3 @@ macro_rules! static_rwlock {
     };
 }
 pub(crate) use static_rwlock;
-

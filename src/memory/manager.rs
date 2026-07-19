@@ -16,30 +16,18 @@ pub struct MemoryStats {
     pub command_arena_committed: usize,
 }
 
-/// Central manager for memory subsystems.
-pub struct MemoryManager {
-    // In a real engine, these might be Arc<Mutex<...>> or similar shared references.
-    // For this implementation, we just define the structure.
-    // To actually manage them, we'd need to register them or own them.
-    // Proposal: "Trim all subsystems... Call after level unload..."
-
-    // We'll use a registry pattern or just static access in a real engine.
-    // Here we'll just provide the methods that WOULD operate on them.
-}
-
-impl Default for MemoryManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Stateless facade over the global memory subsystems.
+///
+/// The subsystems are process-wide singletons (`GlobalBinnedAllocator`,
+/// `GlobalChunkPool`, `GlobalSharedPagePool`, per-thread frame arenas), so
+/// there is nothing to construct or own here — both operations are
+/// associated functions.
+pub struct MemoryManager;
 
 impl MemoryManager {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {}
-    }
-
-    /// Release all unused memory to the OS.
+    /// Release all unused memory to the OS. Frame arenas trim
+    /// cooperatively: other threads flush the next time they touch their
+    /// arena.
     pub fn trim() {
         GlobalBinnedAllocator::trim();
         GlobalSharedPagePool::trim();
@@ -47,7 +35,11 @@ impl MemoryManager {
         frame_arena::signal_trim_all();
     }
 
-    pub fn stats(&self) -> MemoryStats {
+    /// Snapshot the diagnostic counters. Values are `Relaxed` reads:
+    /// individually eventually-consistent, and cross-counter sums may be
+    /// transiently inconsistent (see `stats`).
+    #[must_use]
+    pub fn stats() -> MemoryStats {
         MemoryStats {
             total_reserved: stats::TOTAL_RESERVED.load(Ordering::Relaxed),
             total_committed: stats::TOTAL_COMMITTED.load(Ordering::Relaxed),
@@ -70,39 +62,35 @@ mod tests {
     #[test]
     fn test_memory_manager_integration() {
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
-        // M1: Create manager
-        let manager = MemoryManager::new();
-        let _stats = manager.stats();
+        // M1: Snapshot is readable
+        let _stats = MemoryManager::stats();
     }
 
     #[test]
     fn test_memory_stats_aggregation() {
         let _guard = crate::memory::TEST_MUTEX.write().unwrap();
         // M2: Alloc from subsystem, verify manager stats
-        let manager = MemoryManager::new();
-        let initial = manager.stats().chunk_pool_committed;
-        let initial_total = manager.stats().total_committed;
+        let initial = MemoryManager::stats().chunk_pool_committed;
 
         // Scope to force drop
         {
             let mut pool = ChunkPool::new(128 * 1024).unwrap();
             let _c = pool.alloc().unwrap();
 
-            let current = manager.stats();
+            let current = MemoryManager::stats();
             assert!(current.chunk_pool_committed >= initial + 128 * 1024);
-            assert!(current.total_committed >= initial_total);
         }
 
         // After drop (and implicit release/trim by Drop impls if any)
         // ChunkPool Drop releases reservation and stats.
-        let final_stats = manager.stats();
+        let final_stats = MemoryManager::stats();
         assert_eq!(final_stats.chunk_pool_committed, initial);
     }
 
     #[test]
     fn test_memory_manager_trim() {
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
-        // M3: Verify trim doesn't panic (logic placeholder)
+        // M3: Verify trim runs against all global subsystems without panicking
         MemoryManager::trim();
     }
 
@@ -110,17 +98,23 @@ mod tests {
     fn test_memory_manager_trim_includes_current_thread_frame_arena() {
         let _guard = crate::memory::TEST_MUTEX.write().unwrap();
 
+        // Assert on THIS thread's arena, not the global gauge: other tests'
+        // threads release their TLS arenas in thread-death destructors that
+        // run after those tests drop TEST_MUTEX, so the global
+        // FRAME_ARENA_COMMITTED value can move even under the write lock.
         with_frame_arena(|arena| {
             arena.reset();
             let _ = arena.alloc_val(1u64).unwrap();
+            assert!(arena.committed_bytes() > 0);
         });
 
-        let before = stats::FRAME_ARENA_COMMITTED.load(Ordering::Relaxed);
-        assert!(before > 0);
-
+        // Trim signals all threads; the current thread trims immediately.
         MemoryManager::trim();
 
-        let after = stats::FRAME_ARENA_COMMITTED.load(Ordering::Relaxed);
-        assert_eq!(after, 0);
+        let committed = with_frame_arena(|arena| arena.committed_bytes());
+        assert_eq!(
+            committed, 0,
+            "MemoryManager::trim did not trim the current thread's frame arena"
+        );
     }
 }
