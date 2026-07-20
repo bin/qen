@@ -49,7 +49,9 @@ pub use memory::binned::{
     BinnedAllocator, BinnedAllocatorConfig, GlobalBinnedAllocator, MAX_SMALL_SIZE,
 };
 pub use memory::chunk_pool::{CHUNK_ALIGN, CHUNK_SIZE, ChunkPool, GlobalChunkPool};
-pub use memory::command_arena::{CommandArena, GlobalSharedPagePool, SharedPagePool};
+pub use memory::command_arena::{
+    CommandArena, CommandRecord, GlobalSharedPagePool, SharedPagePool,
+};
 pub use memory::entity_alloc::{EntityAllocator, EntityLocation};
 pub use memory::frame_arena::{FrameArena, with_frame_arena};
 

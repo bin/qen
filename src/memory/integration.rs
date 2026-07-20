@@ -308,8 +308,8 @@ mod tests {
                     arena.push(i * 1000 + j).unwrap();
                 }
                 // verify items
-                let count = arena.iter_pages().count();
-                assert!(count >= 1);
+                let count = arena.iter().count();
+                assert_eq!(count, 100);
             }));
         }
 

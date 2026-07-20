@@ -303,7 +303,7 @@ mod tests {
                 let mut arena = CommandArena::new(4096, p1);
                 arena.push(1u32).unwrap();
                 arena.push(2u32).unwrap();
-                let count = arena.iter_pages().count();
+                let count = arena.iter().count();
                 assert!(count >= 1);
             });
 
@@ -311,7 +311,7 @@ mod tests {
                 let mut arena = CommandArena::new(4096, p2);
                 arena.push(3u32).unwrap();
                 arena.push(4u32).unwrap();
-                let count = arena.iter_pages().count();
+                let count = arena.iter().count();
                 assert!(count >= 1);
             });
 

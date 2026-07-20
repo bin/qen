@@ -325,12 +325,21 @@ classDiagram
 
         class CommandArena {
             <<Struct>>
-            Paged Linear Allocator
+            Paged Framed Command Buffer
             -original_pages: Vec~PageInfo~
             -current_page: usize
             -cursor: usize
-            +push(T)
-            +iter()
+            +push(T) &mut T
+            +iter() CommandIter
+            +reset()
+        }
+
+        class CommandRecord {
+            <<Borrowed Record>>
+            +type_id() TypeId
+            +size() usize
+            +align() usize
+            +downcast_ref(T) Option~&T~
         }
 
         class SharedPagePool {
@@ -422,6 +431,7 @@ classDiagram
 
     %% Arena Internals
     CommandArena o-- GlobalSharedPagePool : Reuses pages from
+    CommandArena *-- CommandRecord : Owns framed values
     GlobalSharedPagePool --> SharedPagePool : Wraps
 
     %% Entity System Internals

@@ -2,6 +2,8 @@ use super::stats;
 use super::vm::{PlatformVmOps, VmError, VmOps};
 use crate::sync::atomic::Ordering;
 use crate::sync::{Arc, Mutex, OnceLock};
+use std::any::TypeId;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 /// A thread-safe pool of pages to reduce kernel overhead.
@@ -195,8 +197,83 @@ struct PageInfo {
 // Safety: PageInfo owns the memory pointer.
 unsafe impl Send for PageInfo {}
 
-/// A paged linear allocator for command buffers.
-/// Pages are allocated from a shared pool (or VM in this simple implementation).
+#[repr(C)]
+struct CommandHeader {
+    payload_offset: usize,
+    payload_size: usize,
+    payload_align: usize,
+    record_size: usize,
+    type_id: fn() -> TypeId,
+    drop_value: unsafe fn(*mut u8),
+}
+
+fn command_type_id<T: 'static>() -> TypeId {
+    TypeId::of::<T>()
+}
+
+unsafe fn drop_command<T>(ptr: *mut u8) {
+    // Safety: callers pass the aligned payload address at which a live T was
+    // written exactly once, and invoke this function at most once.
+    unsafe { ptr.cast::<T>().drop_in_place() };
+}
+
+fn align_address(address: usize, align: usize) -> Option<usize> {
+    debug_assert!(align.is_power_of_two());
+    address
+        .checked_add(align - 1)
+        .map(|value| value & !(align - 1))
+}
+
+/// A type-erased command borrowed from a [`CommandArena`].
+///
+/// Records are yielded in insertion order. The arena retains ownership of the
+/// value, so a record can only expose shared access; reset or arena destruction
+/// runs the value's destructor exactly once.
+pub struct CommandRecord<'a> {
+    header: &'a CommandHeader,
+    payload: NonNull<u8>,
+    marker: PhantomData<&'a u8>,
+}
+
+impl<'a> CommandRecord<'a> {
+    /// The concrete Rust type stored in this record.
+    #[must_use]
+    pub fn type_id(&self) -> TypeId {
+        (self.header.type_id)()
+    }
+
+    /// The payload size recorded when the command was pushed.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.header.payload_size
+    }
+
+    /// The payload alignment recorded when the command was pushed.
+    #[must_use]
+    pub fn align(&self) -> usize {
+        self.header.payload_align
+    }
+
+    /// Borrow the command when its concrete type is `T`.
+    #[must_use]
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&'a T> {
+        if self.type_id() != TypeId::of::<T>() {
+            return None;
+        }
+
+        // Safety: matching TypeId, size, and alignment metadata were written
+        // with the live T at push time. The record cannot outlive the arena or
+        // coexist with a mutable arena borrow.
+        Some(unsafe { self.payload.cast::<T>().as_ref() })
+    }
+}
+
+/// A paged, framed command buffer.
+///
+/// Each command is stored wholly within one page behind an internal header
+/// containing its type, size, alignment, frame length, and destructor. Iteration
+/// therefore preserves record boundaries without exposing alignment padding or
+/// potentially uninitialized object bytes. Pages come from a shared pool.
 pub struct CommandArena {
     original_pages: Vec<PageInfo>,
     current_page: usize,
@@ -204,8 +281,8 @@ pub struct CommandArena {
     page_size: usize,
     /// Maximum alignment satisfiable on every page. Pool pages are only
     /// guaranteed OS-page-aligned (see [`SharedPagePool::alloc`]), so an
-    /// alignment above `min(page_size, os_page_size)` could fail to fit
-    /// even in a fresh page; [`push`](Self::push) rejects it up front.
+    /// alignment above `min(page_size, os_page_size)` could fail to fit even
+    /// in a fresh page; [`push`](Self::push) rejects it up front.
     max_align: usize,
     pool: Arc<SharedPagePool>,
 }
@@ -217,7 +294,7 @@ impl CommandArena {
     /// Create an arena that carves objects out of `page_size`-byte pages
     /// from `pool`.
     ///
-    /// `page_size` bounds the largest object (see [`push`](Self::push));
+    /// `page_size` bounds the largest framed object (see [`push`](Self::push));
     /// sizes below the OS page granularity still consume a full OS page of
     /// physical memory per arena page.
     ///
@@ -247,29 +324,47 @@ impl CommandArena {
         Ok(())
     }
 
-    /// Push a command object into the arena.
+    /// Push a command into the arena and borrow it mutably.
     ///
-    /// A pushed object must fit entirely within a single page; objects are not
-    /// split across pages.
+    /// The arena owns `value` until [`reset`](Self::reset) or drop. Commands
+    /// must be `Send` because the arena itself can move between threads. The
+    /// returned reference may be used to finish initializing or update the
+    /// command, but the usual mutable-borrow rules prevent another push until
+    /// it is released. A header, alignment padding, and the value must fit
+    /// wholly in one page.
     ///
     /// # Errors
     ///
-    /// Returns `VmError` if the object is too large or if the arena fails to allocate a new page.
-    pub fn push<T: Copy>(&mut self, val: T) -> Result<*mut T, VmError> {
+    /// Returns `VmError` if the framed object is too large or page allocation
+    /// fails. On error, `value` has not entered the arena and is dropped
+    /// normally while the error is returned.
+    pub fn push<T: Send + 'static>(&mut self, value: T) -> Result<&mut T, VmError> {
         let layout = std::alloc::Layout::new::<T>();
         let size = layout.size();
         let align = layout.align();
+        let header_align = std::mem::align_of::<CommandHeader>();
+        let header_size = std::mem::size_of::<CommandHeader>();
 
-        // A single object MUST fit in one page; objects are not split.
+        // A complete record MUST fit in one page; records are not split.
         // Alignment is capped at min(page_size, OS page size): pool pages
         // are only guaranteed OS-page-aligned, so a larger alignment could
         // fail to fit even in a fresh page (the loop below would then
         // reserve new pages forever). Under this cap, a fresh page (cursor
         // 0, OS-page-aligned base ⇒ zero padding) always fits any accepted
         // (size, align), so the loop terminates after at most one add_page.
-        if size > self.page_size || align > self.max_align {
+        // Every fresh page is OS-page aligned, and accepted payload/header
+        // alignments divide that power-of-two alignment. The header therefore
+        // starts at offset zero and this is the exact fresh-page footprint,
+        // rather than a pessimistic align-1 padding bound.
+        let minimum_record_size = align_address(header_size, align)
+            .and_then(|payload_offset| payload_offset.checked_add(size))
+            .unwrap_or(usize::MAX);
+        if minimum_record_size > self.page_size
+            || align > self.max_align
+            || header_align > self.max_align
+        {
             return Err(VmError::ObjectTooLarge {
-                size: std::cmp::max(size, align),
+                size: minimum_record_size.max(align).max(header_align),
                 page_size: self.page_size,
             });
         }
@@ -289,19 +384,28 @@ impl CommandArena {
             let page_ptr = page_info.ptr;
             let page_cap = page_info.capacity;
 
-            // The fit check happens entirely in offsets; a pointer is only
-            // materialized (via `add`) once the range is proven in-bounds.
-            // Speculatively computing an out-of-bounds `end` pointer — as an
-            // earlier revision did — is undefined behaviour even if it is
-            // never dereferenced.
-            //
-            // `cursor` is the offset into the current page (resets to 0 on
-            // page switch); padding is computed from the real address so the
-            // returned pointer is aligned.
-            let current_addr = (page_ptr as usize) + self.cursor;
-            let padding = (align - (current_addr % align)) % align;
-            let start_offset = self.cursor + padding;
-            let end_offset = start_offset.saturating_add(size);
+            let base = page_ptr as usize;
+            let Some(header_address) = base
+                .checked_add(self.cursor)
+                .and_then(|address| align_address(address, header_align))
+            else {
+                return Err(VmError::ObjectTooLarge {
+                    size: usize::MAX,
+                    page_size: self.page_size,
+                });
+            };
+            let header_offset = header_address - base;
+            let Some(payload_address) = header_address
+                .checked_add(header_size)
+                .and_then(|address| align_address(address, align))
+            else {
+                return Err(VmError::ObjectTooLarge {
+                    size: usize::MAX,
+                    page_size: self.page_size,
+                });
+            };
+            let payload_offset = payload_address - base;
+            let end_offset = payload_offset.saturating_add(size);
 
             if end_offset <= page_cap {
                 // Fits in current page
@@ -311,12 +415,32 @@ impl CommandArena {
                     page_info.used = self.cursor;
                 }
 
-                // Safety: start_offset + size <= page_cap, so the range is
-                // in-bounds of the page allocation; padding makes it aligned.
-                let ptr = unsafe { page_ptr.add(start_offset) }.cast::<T>();
-                // Safety: ptr is valid for writes of T (in-bounds, aligned).
-                unsafe { ptr.write(val) };
-                return Ok(ptr);
+                // Safety: both offsets were derived from checked addresses,
+                // have their required alignment, and end_offset <= page_cap;
+                // page_ptr comes from a non-null VM allocation.
+                let header_ptr = unsafe {
+                    NonNull::new_unchecked(page_ptr.add(header_offset)).cast::<CommandHeader>()
+                };
+                // Safety: the payload offset has T's alignment, is in bounds,
+                // and page_ptr comes from a non-null VM allocation.
+                let payload_ptr =
+                    unsafe { NonNull::new_unchecked(page_ptr.add(payload_offset)).cast::<T>() };
+                // Write the payload before publishing its frame header. No
+                // fallible operation follows, so both become live together.
+                // Safety: both pointers are aligned, non-null, in-bounds, and
+                // point to disjoint uninitialized regions.
+                unsafe {
+                    payload_ptr.as_ptr().write(value);
+                    header_ptr.as_ptr().write(CommandHeader {
+                        payload_offset: payload_offset - header_offset,
+                        payload_size: size,
+                        payload_align: align,
+                        record_size: end_offset - header_offset,
+                        type_id: command_type_id::<T>,
+                        drop_value: drop_command::<T>,
+                    });
+                    return Ok(&mut *payload_ptr.as_ptr());
+                }
             }
 
             self.current_page += 1;
@@ -331,8 +455,8 @@ impl CommandArena {
     /// # Panics
     ///
     /// Panics if allocation fails (e.g. out of memory).
-    pub fn push_or_panic<T: Copy>(&mut self, val: T) -> *mut T {
-        match self.push(val) {
+    pub fn push_or_panic<T: Send + 'static>(&mut self, value: T) -> &mut T {
+        match self.push(value) {
             Ok(p) => p,
             Err(e) => panic!("CommandArena::push_or_panic failed: {e:?}"),
         }
@@ -342,77 +466,138 @@ impl CommandArena {
     ///
     /// # Invalidation contract
     ///
-    /// Logically invalidates every pointer previously returned by
-    /// [`push`](Self::push)/[`push_or_panic`](Self::push_or_panic):
-    /// subsequent pushes hand out the same memory again. The returned raw
-    /// pointers are not lifetime-tracked, so the borrow checker cannot
-    /// enforce this — reading through a pre-reset pointer after new pushes
-    /// observes overwritten bytes (undefined behaviour once they no longer
-    /// form a valid `T`).
+    /// Destroys all commands in insertion order, then logically invalidates
+    /// their storage and retains the pages for reuse. If a destructor panics,
+    /// the arena still runs the remaining destructors and resets itself before
+    /// resuming the first panic. Destructors must not access the arena.
     pub fn reset(&mut self) {
+        let first_panic = self.drop_commands();
         self.current_page = 0;
         self.cursor = 0;
         for page in &mut self.original_pages {
             page.used = 0;
         }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
+        }
     }
-    /// Iterate raw used-byte prefixes for each currently used page.
-    ///
-    /// Contract and intended use:
-    /// - Each yielded slice is `&page[0..used]` for one arena page.
-    /// - Slices are page-scoped; there is no cross-page packing layer.
-    /// - Bytes represent raw arena memory, not framed command records.
-    /// - Alignment gaps between consecutive `push<T>()` calls are included.
-    /// - Bytes past `used` in each page are never yielded.
-    ///
-    /// This API is for low-level tooling (diagnostics, dumps, page-prefix hashing,
-    /// transport of raw page payloads). It is **not** a typed command-stream API.
-    ///
-    /// Do not assume:
-    /// - every byte corresponds to command payload,
-    /// - object boundaries are encoded,
-    /// - a single slice contains all pushed commands.
-    ///
-    /// If you need a structured command stream, track record boundaries separately
-    /// (for example, an out-of-band descriptor list).
+
+    fn drop_commands(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
+        let mut first_panic = None;
+        for page in &self.original_pages {
+            let mut offset = 0;
+            while offset < page.used {
+                let base = page.ptr as usize;
+                let header_address =
+                    align_address(base + offset, std::mem::align_of::<CommandHeader>())
+                        .expect("live command header address cannot overflow");
+                let header_offset = header_address - base;
+                // Safety: every live page prefix consists of complete command
+                // frames written by push, and header_offset is header-aligned.
+                let header = unsafe {
+                    NonNull::new_unchecked(page.ptr.add(header_offset))
+                        .cast::<CommandHeader>()
+                        .as_ref()
+                };
+                let payload_offset = header_offset + header.payload_offset;
+                let next_offset = header_offset + header.record_size;
+                // Advance before calling user code so a panic cannot cause this
+                // record to be destroyed twice.
+                offset = next_offset;
+
+                // Safety: the frame owns one live value at this aligned,
+                // in-bounds payload address and this loop visits it once.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    (header.drop_value)(page.ptr.add(payload_offset));
+                }));
+                if let Err(payload) = result
+                    && first_panic.is_none()
+                {
+                    first_panic = Some(payload);
+                }
+            }
+        }
+        first_panic
+    }
+
+    /// Iterate framed commands in insertion order.
     #[inline]
     #[must_use]
-    pub fn iter_pages(&self) -> CommandIter<'_> {
+    pub fn iter(&self) -> CommandIter<'_> {
         CommandIter {
             arena: self,
             page_idx: 0,
+            offset: 0,
         }
+    }
+
+    /// Number of pages containing at least one live command frame.
+    #[must_use]
+    pub fn used_pages(&self) -> usize {
+        self.original_pages
+            .iter()
+            .filter(|page| page.used != 0)
+            .count()
     }
 }
 
+/// Iterator over the live framed records in a [`CommandArena`].
 pub struct CommandIter<'a> {
     arena: &'a CommandArena,
     page_idx: usize,
+    offset: usize,
 }
 
 impl<'a> Iterator for CommandIter<'a> {
-    type Item = &'a [u8];
+    type Item = CommandRecord<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.page_idx <= self.arena.current_page
-            && self.page_idx < self.arena.original_pages.len()
-        {
+        while self.page_idx < self.arena.original_pages.len() {
             let page_info = &self.arena.original_pages[self.page_idx];
-            let len = page_info.used;
-            let ptr = page_info.ptr;
-            self.page_idx += 1;
-
-            if len > 0 {
-                // Safety: ptr and len are tracked by the arena and guaranteed valid.
-                return Some(unsafe { std::slice::from_raw_parts(ptr, len) });
+            if self.offset >= page_info.used {
+                self.page_idx += 1;
+                self.offset = 0;
+                continue;
             }
+
+            let base = page_info.ptr as usize;
+            let header_address =
+                align_address(base + self.offset, std::mem::align_of::<CommandHeader>())?;
+            let header_offset = header_address - base;
+            // Safety: live used prefixes consist only of complete frames and
+            // the computed address satisfies CommandHeader alignment.
+            let header = unsafe {
+                NonNull::new_unchecked(page_info.ptr.add(header_offset))
+                    .cast::<CommandHeader>()
+                    .as_ref()
+            };
+            let payload_offset = header_offset + header.payload_offset;
+            self.offset = header_offset + header.record_size;
+            // Safety: the header describes the in-bounds payload written in
+            // the same frame. VM allocations are never null.
+            let payload = unsafe { NonNull::new_unchecked(page_info.ptr.add(payload_offset)) };
+            return Some(CommandRecord {
+                header,
+                payload,
+                marker: PhantomData,
+            });
         }
         None
     }
 }
 
+impl<'a> IntoIterator for &'a CommandArena {
+    type Item = CommandRecord<'a>;
+    type IntoIter = CommandIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 impl Drop for CommandArena {
     fn drop(&mut self) {
+        let first_panic = self.drop_commands();
         // Return all pages to pool
         for page in &self.original_pages {
             if let Some(p) = NonNull::new(page.ptr) {
@@ -421,6 +606,11 @@ impl Drop for CommandArena {
                     self.pool.free(p, page.capacity);
                 }
             }
+        }
+        if let Some(payload) = first_panic
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(payload);
         }
     }
 }
@@ -448,17 +638,11 @@ mod tests {
 
         // Push small item
         let p1 = arena.push(42u32).unwrap();
-        // Safety: Test code.
-        unsafe {
-            assert_eq!(*p1, 42);
-        }
+        assert_eq!(*p1, 42);
 
         // Push another
         let p2 = arena.push(123u64).unwrap();
-        // Safety: Test code.
-        unsafe {
-            assert_eq!(*p2, 123);
-        }
+        assert_eq!(*p2, 123);
 
         // Push until page fills
         let mut pushes = 0;
@@ -474,10 +658,7 @@ mod tests {
 
         // Should reuse pages
         let p_new = arena.push(999u32).unwrap();
-        // Safety: Test code.
-        unsafe {
-            assert_eq!(*p_new, 999);
-        }
+        assert_eq!(*p_new, 999);
     }
 
     #[cfg(any(debug_assertions, feature = "hardened"))]
@@ -504,15 +685,13 @@ mod tests {
         let pool = Arc::new(SharedPagePool::new(1024 * 1024));
         let mut arena = CommandArena::new(page_size, pool);
 
-        let p1 = arena.push(1u8).unwrap();
-        let p2 = arena.push(1u32).unwrap();
-        let p3 = arena.push(1u64).unwrap();
+        let p1 = std::ptr::from_mut(arena.push(1u8).unwrap()) as usize;
+        let p2 = std::ptr::from_mut(arena.push(1u32).unwrap()) as usize;
+        let p3 = std::ptr::from_mut(arena.push(1u64).unwrap()) as usize;
 
-        {
-            assert_eq!(p1 as usize % std::mem::align_of::<u8>(), 0);
-            assert_eq!(p2 as usize % std::mem::align_of::<u32>(), 0);
-            assert_eq!(p3 as usize % std::mem::align_of::<u64>(), 0);
-        }
+        assert_eq!(p1 % std::mem::align_of::<u8>(), 0);
+        assert_eq!(p2 % std::mem::align_of::<u32>(), 0);
+        assert_eq!(p3 % std::mem::align_of::<u64>(), 0);
     }
 
     #[test]
@@ -520,7 +699,7 @@ mod tests {
         use crate::sync::Arc;
 
         // Unused field, but recall ZSTs are UB on allocator API, cf. nomicon
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, Debug)]
         #[repr(align(131072))]
         #[allow(dead_code)]
         struct HugeAlign(u8); // 128KB alignment, exceeds any base page size we support.
@@ -539,7 +718,7 @@ mod tests {
                 page_size: ps,
             }) => {
                 assert_eq!(ps, page_size);
-                assert_eq!(size, std::cmp::max(1, std::mem::align_of::<HugeAlign>()));
+                assert!(size >= std::mem::align_of::<HugeAlign>());
             }
             other => panic!("expected ObjectTooLarge, got {other:?}"),
         }
@@ -595,7 +774,11 @@ mod tests {
 
         for i in 0..8 {
             let p = arena.push(PageAligned([i; 64])).unwrap();
-            assert_eq!(p as usize % 4096, 0, "push {i} misaligned");
+            assert_eq!(
+                std::ptr::from_mut(p) as usize % 4096,
+                0,
+                "push {i} misaligned"
+            );
         }
     }
 
@@ -603,7 +786,7 @@ mod tests {
     fn test_command_arena_growth() {
         #[derive(Clone, Copy)]
         struct PageData {
-            _d: [u8; 4096],
+            _d: [u8; 4000],
         }
 
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
@@ -617,8 +800,8 @@ mod tests {
         arena.push(1u8).unwrap();
 
         // Force new pages
-        arena.push(PageData { _d: [0; 4096] }).unwrap(); // Page 2
-        arena.push(PageData { _d: [0; 4096] }).unwrap(); // Page 3 (exceeds pool cache capacity, but should succeed alloc from OS)
+        arena.push(PageData { _d: [0; 4000] }).unwrap(); // Page 2
+        arena.push(PageData { _d: [0; 4000] }).unwrap(); // Page 3 (exceeds pool cache capacity, but should succeed alloc from OS)
 
         // Should succeed
     }
@@ -632,18 +815,96 @@ mod tests {
         let mut arena = CommandArena::new(page_size, pool);
 
         let p1 = arena.push(123u64).unwrap();
-        let addr1 = p1 as usize;
+        let addr1 = std::ptr::from_mut(p1) as usize;
 
         arena.reset();
 
         let p2 = arena.push(456u64).unwrap();
-        let addr2 = p2 as usize;
+        let addr2 = std::ptr::from_mut(p2) as usize;
 
         assert_eq!(addr1, addr2);
-        // Safety: Test code.
-        unsafe {
-            assert_eq!(*p2, 456);
+        assert_eq!(*p2, 456);
+    }
+
+    #[test]
+    fn test_command_arena_owns_and_drops_commands_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
+
+        struct DropCounter(Arc<AtomicUsize>);
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, StdOrdering::SeqCst);
+            }
         }
+
+        let _guard = crate::memory::TEST_MUTEX.read().unwrap();
+        let page_size = 4096;
+        let pool = Arc::new(SharedPagePool::new(page_size * 4));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut arena = CommandArena::new(page_size, pool);
+
+        arena.push(DropCounter(drops.clone())).unwrap();
+        arena.push(String::from("typed, non-Copy command")).unwrap();
+        assert_eq!(arena.iter().count(), 2);
+        assert_eq!(
+            arena
+                .iter()
+                .nth(1)
+                .and_then(|record| record.downcast_ref::<String>()),
+            Some(&String::from("typed, non-Copy command"))
+        );
+
+        arena.reset();
+        assert_eq!(drops.load(StdOrdering::SeqCst), 1);
+        assert_eq!(arena.iter().count(), 0);
+
+        arena.push(DropCounter(drops.clone())).unwrap();
+        drop(arena);
+        assert_eq!(drops.load(StdOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_command_arena_finishes_reset_when_a_destructor_panics() {
+        use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
+
+        struct DropAction {
+            drops: Arc<AtomicUsize>,
+            panic: bool,
+        }
+
+        impl Drop for DropAction {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, StdOrdering::SeqCst);
+                assert!(!self.panic, "intentional command destructor panic");
+            }
+        }
+
+        let _guard = crate::memory::TEST_MUTEX.read().unwrap();
+        let page_size = 4096;
+        let pool = Arc::new(SharedPagePool::new(page_size * 4));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut arena = CommandArena::new(page_size, pool);
+        arena
+            .push(DropAction {
+                drops: drops.clone(),
+                panic: true,
+            })
+            .unwrap();
+        arena
+            .push(DropAction {
+                drops: drops.clone(),
+                panic: false,
+            })
+            .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| arena.reset()));
+        assert!(result.is_err());
+        assert_eq!(drops.load(StdOrdering::SeqCst), 2);
+        assert_eq!(arena.iter().count(), 0);
+
+        arena.push(7u32).unwrap();
+        assert_eq!(arena.iter().count(), 1);
     }
 
     #[test]
@@ -688,12 +949,7 @@ mod tests {
         let mut arena = CommandArena::new(page_size, pool);
 
         let p = arena.push(()).unwrap();
-        // ZST usually has dangling pointer or non-null.
-        // Should not crash.
-        // Safety: Test code.
-        unsafe {
-            assert_eq!(*p, ());
-        }
+        assert_eq!(*p, ());
     }
 
     #[test]
@@ -761,14 +1017,10 @@ mod tests {
         arena.push(1u8).unwrap();
         let _ = arena.push(2u32).unwrap();
 
-        let chunks: Vec<_> = arena.iter_pages().collect();
-        assert_eq!(chunks.len(), 1); // 1 page
-        // Size should be 1 + padding + 4.
-        // align of u32 is 4.
-        // 1u8 is at 0.
-        // 2u32 is at 4. (padding 3 bytes).
-        // Total 8 bytes used.
-        assert_eq!(chunks[0].len(), 8);
+        let records: Vec<_> = arena.iter().collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].downcast_ref::<u8>(), Some(&1));
+        assert_eq!(records[1].downcast_ref::<u32>(), Some(&2));
     }
 
     #[test]
@@ -779,15 +1031,14 @@ mod tests {
         let pool = Arc::new(SharedPagePool::new(page_size));
         let arena = CommandArena::new(page_size, pool);
 
-        let count = arena.iter_pages().count();
+        let count = arena.iter().count();
         assert_eq!(count, 0);
     }
 
     #[test]
     fn test_command_arena_iter_after_push() {
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
-        // I2: Push N items, iter — yields items in order (well, yields pages)
-        // CommandArena iter yields slices of pages.
+        // I2: Push N items, iter — yields framed items in order.
         let page_size = 4096;
         let pool = Arc::new(SharedPagePool::new(page_size));
         let mut arena = CommandArena::new(page_size, pool);
@@ -795,9 +1046,10 @@ mod tests {
         arena.push(1u8).unwrap();
         arena.push(2u8).unwrap();
 
-        let chunks: Vec<_> = arena.iter_pages().collect();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 2);
+        let records: Vec<_> = arena.iter().collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].downcast_ref::<u8>(), Some(&1));
+        assert_eq!(records[1].downcast_ref::<u8>(), Some(&2));
     }
 
     #[test]
@@ -807,7 +1059,7 @@ mod tests {
 
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
         // I3: Push enough to span pages, iter — yields all in order
-        let page_size = 128; // Small page
+        let page_size = 192; // Small page, but large enough for one framed Item.
         let pool = Arc::new(SharedPagePool::new(page_size * 4));
         let mut arena = CommandArena::new(page_size, pool);
 
@@ -818,12 +1070,12 @@ mod tests {
         arena.push(Item([1; 100])).unwrap(); // Page 2
         arena.push(Item([2; 100])).unwrap(); // Page 3
 
-        let chunks: Vec<_> = arena.iter_pages().collect();
-        assert_eq!(chunks.len(), 3);
-
-        assert_eq!(chunks[0].len(), 100);
-        assert_eq!(chunks[1].len(), 100);
-        assert_eq!(chunks[2].len(), 100);
+        let records: Vec<_> = arena.iter().collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].downcast_ref::<Item>().unwrap().0[0], 0);
+        assert_eq!(records[1].downcast_ref::<Item>().unwrap().0[0], 1);
+        assert_eq!(records[2].downcast_ref::<Item>().unwrap().0[0], 2);
+        assert_eq!(arena.used_pages(), 3);
     }
 
     #[test]
@@ -837,14 +1089,14 @@ mod tests {
         arena.push(1u8).unwrap();
         arena.reset();
 
-        let count = arena.iter_pages().count();
+        let count = arena.iter().count();
         assert_eq!(count, 0);
 
         // Push again
         arena.push(2u8).unwrap();
-        let chunks: Vec<_> = arena.iter_pages().collect();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 1);
+        let records: Vec<_> = arena.iter().collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].downcast_ref::<u8>(), Some(&2));
     }
 
     #[test]
@@ -1049,35 +1301,32 @@ mod tests {
         #[derive(Clone, Copy)]
         #[repr(C)]
         struct NearPageSize {
-            _data: [u8; 4095], // page_size - 1
+            _data: [u8; 4000],
         }
 
         let _guard = crate::memory::TEST_MUTEX.read().unwrap();
-        // Push items of size (page_size - 1). Each item wastes ~1 byte per page,
-        // but the remainder after the first item can't fit a second → 1 item per page.
-        // This documents the P9 fragmentation issue.
+        // Push items that nearly fill a page once their frame header is
+        // included. The remainder cannot fit another record.
         let page_size = 4096;
         let pool = Arc::new(SharedPagePool::new(page_size * 100));
         let mut arena = CommandArena::new(page_size, pool);
 
         let num_items = 10;
         for _ in 0..num_items {
-            arena.push(NearPageSize { _data: [0; 4095] }).unwrap();
+            arena.push(NearPageSize { _data: [0; 4000] }).unwrap();
         }
 
         // Count pages used
-        let pages_used = arena.iter_pages().count();
+        let pages_used = arena.used_pages();
 
-        // With 4095-byte items in 4096-byte pages, each item takes a full page.
-        // Fragmentation ratio = wasted / total = 1/4096 per page = ~0.02%.
-        // But if alignment padding pushes it over, we get 1 item per page.
+        // The payload plus framing leaves too little room for another record.
         assert_eq!(
             pages_used, num_items,
             "Near-page-size items should each consume a full page (P9 fragmentation)"
         );
 
-        // Document: effective utilization is 4095/4096 = 99.97% per page.
-        // The real issue is with items of size ~page_size/2, which waste ~50%.
+        // The real fragmentation case is payloads slightly over half the
+        // usable page size, covered below.
     }
 
     #[test]
@@ -1099,7 +1348,7 @@ mod tests {
             arena.push(HalfPlusOne { _data: [0; 2049] }).unwrap();
         }
 
-        let pages_used = arena.iter_pages().count();
+        let pages_used = arena.used_pages();
         // Each item > half page → 1 item per page → 50% waste
         assert_eq!(
             pages_used, num_items,
