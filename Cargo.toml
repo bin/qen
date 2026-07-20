@@ -9,7 +9,11 @@ publish = false
 edition = "2024"
 
 [lib]
-crate-type = ["rlib", "dylib", "staticlib"]
+# Qen is a Rust library. Native benchmark consumers link the dedicated
+# `bench/qen-adapter` staticlib, so forcing every Rust dependency build to also
+# produce dylib/staticlib artifacts only creates duplicate outputs and can make
+# downstream release profiles fail when their panic/link strategies differ.
+crate-type = ["rlib"]
 
 [features]
 default = []
