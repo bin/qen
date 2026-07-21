@@ -202,9 +202,18 @@ struct CommandHeader {
     payload_offset: usize,
     payload_size: usize,
     payload_align: usize,
+    element_count: usize,
     record_size: usize,
+    payload_kind: CommandPayloadKind,
     type_id: fn() -> TypeId,
     drop_value: unsafe fn(*mut u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum CommandPayloadKind {
+    Value,
+    Slice,
 }
 
 fn command_type_id<T: 'static>() -> TypeId {
@@ -216,6 +225,8 @@ unsafe fn drop_command<T>(ptr: *mut u8) {
     // written exactly once, and invoke this function at most once.
     unsafe { ptr.cast::<T>().drop_in_place() };
 }
+
+unsafe fn drop_nothing(_: *mut u8) {}
 
 fn align_address(address: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two());
@@ -254,10 +265,26 @@ impl<'a> CommandRecord<'a> {
         self.header.payload_align
     }
 
+    /// Whether this record contains a dynamically sized slice rather than one
+    /// sized Rust value.
+    #[must_use]
+    pub fn is_slice(&self) -> bool {
+        self.header.payload_kind == CommandPayloadKind::Slice
+    }
+
+    /// Number of elements in a slice record. Sized-value records return
+    /// `None` so a one-element slice remains distinguishable from one value.
+    #[must_use]
+    pub fn slice_len(&self) -> Option<usize> {
+        self.is_slice().then_some(self.header.element_count)
+    }
+
     /// Borrow the command when its concrete type is `T`.
     #[must_use]
     pub fn downcast_ref<T: 'static>(&self) -> Option<&'a T> {
-        if self.type_id() != TypeId::of::<T>() {
+        if self.header.payload_kind != CommandPayloadKind::Value
+            || self.type_id() != TypeId::of::<T>()
+        {
             return None;
         }
 
@@ -265,6 +292,26 @@ impl<'a> CommandRecord<'a> {
         // with the live T at push time. The record cannot outlive the arena or
         // coexist with a mutable arena borrow.
         Some(unsafe { self.payload.cast::<T>().as_ref() })
+    }
+
+    /// Borrow a copied slice when its element type is `T`.
+    #[must_use]
+    pub fn downcast_slice<T: 'static>(&self) -> Option<&'a [T]> {
+        if self.header.payload_kind != CommandPayloadKind::Slice
+            || self.type_id() != TypeId::of::<T>()
+            || self.header.payload_align != std::mem::align_of::<T>()
+            || self.header.payload_size
+                != std::mem::size_of::<T>().checked_mul(self.header.element_count)?
+        {
+            return None;
+        }
+
+        // Safety: push_slice initialized exactly element_count contiguous T
+        // values at this aligned payload address. The shared slice cannot
+        // outlive the arena or coexist with a mutable arena borrow.
+        Some(unsafe {
+            std::slice::from_raw_parts(self.payload.cast::<T>().as_ptr(), self.header.element_count)
+        })
     }
 }
 
@@ -285,6 +332,13 @@ pub struct CommandArena {
     /// in a fresh page; [`push`](Self::push) rejects it up front.
     max_align: usize,
     pool: Arc<SharedPagePool>,
+}
+
+struct VacantCommandFrame {
+    header: NonNull<CommandHeader>,
+    payload: NonNull<u8>,
+    payload_offset: usize,
+    record_size: usize,
 }
 
 // Safety: CommandArena owns its pages.
@@ -324,22 +378,7 @@ impl CommandArena {
         Ok(())
     }
 
-    /// Push a command into the arena and borrow it mutably.
-    ///
-    /// The arena owns `value` until [`reset`](Self::reset) or drop. Commands
-    /// must be `Send` because the arena itself can move between threads. The
-    /// returned reference may be used to finish initializing or update the
-    /// command, but the usual mutable-borrow rules prevent another push until
-    /// it is released. A header, alignment padding, and the value must fit
-    /// wholly in one page.
-    ///
-    /// # Errors
-    ///
-    /// Returns `VmError` if the framed object is too large or page allocation
-    /// fails. On error, `value` has not entered the arena and is dropped
-    /// normally while the error is returned.
-    pub fn push<T: Send + 'static>(&mut self, value: T) -> Result<&mut T, VmError> {
-        let layout = std::alloc::Layout::new::<T>();
+    fn reserve_frame(&mut self, layout: std::alloc::Layout) -> Result<VacantCommandFrame, VmError> {
         let size = layout.size();
         let align = layout.align();
         let header_align = std::mem::align_of::<CommandHeader>();
@@ -348,14 +387,8 @@ impl CommandArena {
         // A complete record MUST fit in one page; records are not split.
         // Alignment is capped at min(page_size, OS page size): pool pages
         // are only guaranteed OS-page-aligned, so a larger alignment could
-        // fail to fit even in a fresh page (the loop below would then
-        // reserve new pages forever). Under this cap, a fresh page (cursor
-        // 0, OS-page-aligned base ⇒ zero padding) always fits any accepted
-        // (size, align), so the loop terminates after at most one add_page.
-        // Every fresh page is OS-page aligned, and accepted payload/header
-        // alignments divide that power-of-two alignment. The header therefore
-        // starts at offset zero and this is the exact fresh-page footprint,
-        // rather than a pessimistic align-1 padding bound.
+        // fail to fit even in a fresh page. Under this cap, a fresh page
+        // always fits any accepted layout and the loop adds at most one page.
         let minimum_record_size = align_address(header_size, align)
             .and_then(|payload_offset| payload_offset.checked_add(size))
             .unwrap_or(usize::MAX);
@@ -369,13 +402,11 @@ impl CommandArena {
             });
         }
 
-        // Ensure we have at least one page
         if self.original_pages.is_empty() {
             self.add_page()?;
         }
 
         loop {
-            // Check if we ran out of pages
             if self.current_page >= self.original_pages.len() {
                 self.add_page()?;
             }
@@ -383,7 +414,6 @@ impl CommandArena {
             let page_info = &mut self.original_pages[self.current_page];
             let page_ptr = page_info.ptr;
             let page_cap = page_info.capacity;
-
             let base = page_ptr as usize;
             let Some(header_address) = base
                 .checked_add(self.cursor)
@@ -408,43 +438,105 @@ impl CommandArena {
             let end_offset = payload_offset.saturating_add(size);
 
             if end_offset <= page_cap {
-                // Fits in current page
                 self.cursor = end_offset;
-                // Update used
-                if self.cursor > page_info.used {
-                    page_info.used = self.cursor;
-                }
-
-                // Safety: both offsets were derived from checked addresses,
-                // have their required alignment, and end_offset <= page_cap;
-                // page_ptr comes from a non-null VM allocation.
-                let header_ptr = unsafe {
-                    NonNull::new_unchecked(page_ptr.add(header_offset)).cast::<CommandHeader>()
-                };
-                // Safety: the payload offset has T's alignment, is in bounds,
-                // and page_ptr comes from a non-null VM allocation.
-                let payload_ptr =
-                    unsafe { NonNull::new_unchecked(page_ptr.add(payload_offset)).cast::<T>() };
-                // Write the payload before publishing its frame header. No
-                // fallible operation follows, so both become live together.
-                // Safety: both pointers are aligned, non-null, in-bounds, and
-                // point to disjoint uninitialized regions.
-                unsafe {
-                    payload_ptr.as_ptr().write(value);
-                    header_ptr.as_ptr().write(CommandHeader {
+                page_info.used = page_info.used.max(self.cursor);
+                // Safety: offsets were derived from checked addresses, have
+                // their requested alignment, and lie within a live page.
+                return Ok(unsafe {
+                    VacantCommandFrame {
+                        header: NonNull::new_unchecked(page_ptr.add(header_offset))
+                            .cast::<CommandHeader>(),
+                        payload: NonNull::new_unchecked(page_ptr.add(payload_offset)),
                         payload_offset: payload_offset - header_offset,
-                        payload_size: size,
-                        payload_align: align,
                         record_size: end_offset - header_offset,
-                        type_id: command_type_id::<T>,
-                        drop_value: drop_command::<T>,
-                    });
-                    return Ok(&mut *payload_ptr.as_ptr());
-                }
+                    }
+                });
             }
 
             self.current_page += 1;
             self.cursor = 0;
+        }
+    }
+
+    /// Push a command into the arena and borrow it mutably.
+    ///
+    /// The arena owns `value` until [`reset`](Self::reset) or drop. Commands
+    /// must be `Send` because the arena itself can move between threads. The
+    /// returned reference may be used to finish initializing or update the
+    /// command, but the usual mutable-borrow rules prevent another push until
+    /// it is released. A header, alignment padding, and the value must fit
+    /// wholly in one page.
+    ///
+    /// # Errors
+    ///
+    /// Returns `VmError` if the framed object is too large or page allocation
+    /// fails. On error, `value` has not entered the arena and is dropped
+    /// normally while the error is returned.
+    pub fn push<T: Send + 'static>(&mut self, value: T) -> Result<&mut T, VmError> {
+        let layout = std::alloc::Layout::new::<T>();
+        let frame = self.reserve_frame(layout)?;
+        // Write the payload before publishing its frame header. No fallible
+        // operation follows, so both become live together.
+        // Safety: reserve_frame returned aligned, non-overlapping in-page
+        // storage for the header and T.
+        unsafe {
+            let payload = frame.payload.cast::<T>();
+            payload.as_ptr().write(value);
+            frame.header.as_ptr().write(CommandHeader {
+                payload_offset: frame.payload_offset,
+                payload_size: layout.size(),
+                payload_align: layout.align(),
+                element_count: 1,
+                record_size: frame.record_size,
+                payload_kind: CommandPayloadKind::Value,
+                type_id: command_type_id::<T>,
+                drop_value: drop_command::<T>,
+            });
+            Ok(&mut *payload.as_ptr())
+        }
+    }
+
+    /// Copy one dynamically sized slice into a single framed arena record.
+    ///
+    /// The element type must be `Copy` because reset is O(records), not
+    /// O(elements), and therefore does not run one destructor per element.
+    /// The complete slice plus framing must fit within one arena page. This is
+    /// useful for bounded encoded commands and transaction payload chunks that
+    /// should live entirely in Qen rather than owning a secondary heap buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `VmError` if the layout overflows, the framed slice is too
+    /// large, or page allocation fails. On error no live record is added.
+    pub fn push_slice<T: Copy + Send + 'static>(
+        &mut self,
+        values: &[T],
+    ) -> Result<&mut [T], VmError> {
+        let layout =
+            std::alloc::Layout::array::<T>(values.len()).map_err(|_| VmError::ObjectTooLarge {
+                size: usize::MAX,
+                page_size: self.page_size,
+            })?;
+        let frame = self.reserve_frame(layout)?;
+        // Safety: reserve_frame returned storage for values.len() contiguous
+        // T values, and the source cannot overlap the arena-owned destination.
+        unsafe {
+            let payload = frame.payload.cast::<T>();
+            std::ptr::copy_nonoverlapping(values.as_ptr(), payload.as_ptr(), values.len());
+            frame.header.as_ptr().write(CommandHeader {
+                payload_offset: frame.payload_offset,
+                payload_size: layout.size(),
+                payload_align: layout.align(),
+                element_count: values.len(),
+                record_size: frame.record_size,
+                payload_kind: CommandPayloadKind::Slice,
+                type_id: command_type_id::<T>,
+                drop_value: drop_nothing,
+            });
+            Ok(std::slice::from_raw_parts_mut(
+                payload.as_ptr(),
+                values.len(),
+            ))
         }
     }
 
@@ -538,6 +630,14 @@ impl CommandArena {
             .iter()
             .filter(|page| page.used != 0)
             .count()
+    }
+
+    /// Bytes occupied by live record headers, padding, and payloads.
+    #[must_use]
+    pub fn used_bytes(&self) -> usize {
+        self.original_pages
+            .iter()
+            .fold(0usize, |total, page| total.saturating_add(page.used))
     }
 }
 
@@ -1021,6 +1121,43 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].downcast_ref::<u8>(), Some(&1));
         assert_eq!(records[1].downcast_ref::<u32>(), Some(&2));
+    }
+
+    #[test]
+    fn command_arena_copies_and_distinguishes_slice_records() {
+        let _guard = crate::memory::TEST_MUTEX.read().unwrap();
+        let page_size = 4096;
+        let pool = Arc::new(SharedPagePool::new(page_size * 2));
+        let mut arena = CommandArena::new(page_size, pool);
+
+        let source = [11u32, 22, 33, 44];
+        arena.push_slice(&source).unwrap()[1] = 99;
+        arena.push(7u32).unwrap();
+        arena.push_slice::<u8>(&[]).unwrap();
+
+        let records = arena.iter().collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        assert!(records[0].is_slice());
+        assert_eq!(records[0].slice_len(), Some(4));
+        assert_eq!(
+            records[0].downcast_slice::<u32>(),
+            Some(&[11, 99, 33, 44][..])
+        );
+        assert_eq!(records[0].downcast_ref::<u32>(), None);
+        assert_eq!(records[1].downcast_ref::<u32>(), Some(&7));
+        assert_eq!(records[1].downcast_slice::<u32>(), None);
+        assert_eq!(records[2].downcast_slice::<u8>(), Some(&[][..]));
+        assert!(arena.used_bytes() >= source.len() * std::mem::size_of::<u32>());
+
+        arena.reset();
+        assert_eq!(arena.used_bytes(), 0);
+        assert_eq!(arena.iter().count(), 0);
+
+        assert!(matches!(
+            arena.push_slice(&[0u8; 4096]),
+            Err(VmError::ObjectTooLarge { .. })
+        ));
+        assert_eq!(arena.iter().count(), 0);
     }
 
     #[test]
